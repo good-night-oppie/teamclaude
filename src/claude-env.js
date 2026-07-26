@@ -127,3 +127,67 @@ function encodePinToken(name) {
   return encodeURIComponent(name)
     .replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
 }
+
+// ── direct-launch environment hygiene ───────────────────────
+
+// Proxy variables a parent shell may already carry. Set as a group by `run`'s
+// MITM branch and by `teamclaude env`, so they are also inherited as a group.
+const PROXY_VARS = ['HTTPS_PROXY', 'HTTP_PROXY', 'https_proxy', 'http_proxy'];
+
+/**
+ * What a DIRECT launch must do about proxy variables it inherited.
+ *
+ * `--auto-fallback` promises to launch claude "directly, bypassing the proxy"
+ * when the proxy is down — but the child inherits the parent's environment, and
+ * the parent shell of a teamclaude session is usually one teamclaude itself set
+ * up. So the traffic goes right back through a proxy, and the promise is broken
+ * in one of two ways: the variable points at the port we JUST found dead, and
+ * every request fails; or it points at some OTHER live proxy, and the session
+ * silently runs somewhere the operator was told it would not. The second is the
+ * worse one — a wrong destination reported as no destination.
+ *
+ * The rule is deliberately narrow. Clear only what is provably ours and provably
+ * dead: a proxy variable pointing at loopback on the very port whose liveness we
+ * just probed and lost. Anything else — a corporate egress proxy, a different
+ * live teamclaude — is someone's deliberate configuration and is NOT deleted
+ * behind their back; it is returned in `remaining` so the caller can qualify its
+ * "direct launch" claim instead of lying about it. Reporting what we will not
+ * touch is the same discipline splitRunArgs applies to misplaced flags.
+ *
+ * ANTHROPIC_BASE_URL is cleared unconditionally when it points at that dead
+ * port: unlike the proxy vars it has exactly one meaning here, and leaving it
+ * would send every request to a closed socket.
+ *
+ * Pure: takes an env object, returns a plan, mutates nothing.
+ */
+export function directLaunchEnvPlan(env, port) {
+  const source = env && typeof env === 'object' ? env : {};
+  const ours = new RegExp(`^https?://(127\\.0\\.0\\.1|localhost|\\[::1\\]):${Number(port)}(/|$)`, 'i');
+
+  // `remaining` is grouped BY VALUE, not listed per variable. The four proxy
+  // vars are conventionally set as one group to one URL — teamclaude's own MITM
+  // branch does exactly that — so reporting them individually turns a single
+  // fact into four near-identical lines and buries it. One destination, one row.
+  const clear = [];
+  const byValue = new Map();
+  for (const name of PROXY_VARS) {
+    const value = source[name];
+    if (typeof value !== 'string' || !value) continue;
+    if (ours.test(value)) { clear.push(name); continue; }
+    if (!byValue.has(value)) byValue.set(value, []);
+    byValue.get(value).push(name);
+  }
+  const remaining = [...byValue.entries()].map(([value, names]) => ({ names, value }));
+
+  const base = source.ANTHROPIC_BASE_URL;
+  if (typeof base === 'string' && ours.test(base)) clear.push('ANTHROPIC_BASE_URL');
+
+  // Our MITM leaf is worthless to a direct launch and only matters alongside a
+  // proxy we are clearing; drop it with them rather than leaving a dangling
+  // trust anchor, but only when we actually cleared a proxy var.
+  if (clear.length && typeof source.NODE_EXTRA_CA_CERTS === 'string' && source.NODE_EXTRA_CA_CERTS) {
+    clear.push('NODE_EXTRA_CA_CERTS');
+  }
+
+  return { clear, remaining };
+}
