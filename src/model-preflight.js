@@ -86,7 +86,11 @@ const MODEL_EQ = '--model=';
 // `teamclaude run`'s own flags. Booleans are recognized bare; --account takes a
 // value, in either the space or the `=` form. Kept as data so the split, the
 // strip, the unknown-flag check and the help text cannot drift.
-export const RUN_BOOLEAN_FLAGS = ['--mitm', '--no-mitm', '--auto-fallback', '--force', '--strict', '--no-preflight'];
+// `--no-launch-line` is spelled distinctively on purpose (see splitRunArgs): in
+// the unseparated form an own-flag is stripped from claude's argv, so a name
+// claude might plausibly also use — `--quiet` being the obvious temptation —
+// would be silently eaten out of an unseparated launch.
+export const RUN_BOOLEAN_FLAGS = ['--mitm', '--no-mitm', '--auto-fallback', '--force', '--strict', '--no-preflight', '--no-launch-line'];
 export const RUN_VALUE_FLAGS = ['--account'];
 
 // The subset that changes teamclaude's posture rather than the transport. These
@@ -135,6 +139,7 @@ export function splitRunArgs(rest) {
     force: own.includes('--force'),
     strict: own.includes('--strict'),
     preflight: !own.includes('--no-preflight'),
+    launchLine: !own.includes('--no-launch-line'),
     // Only meaningful in the separated form: with no `--`, an unrecognized flag
     // is claude's by construction and must be passed through.
     unknownFlags: sep >= 0 ? unknownOwnFlags(own) : [],

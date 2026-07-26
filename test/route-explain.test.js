@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { explainRouting, formatExplain } from '../src/route-explain.js';
+import { explainRouting, formatExplain, launchSummary } from '../src/route-explain.js';
 import { preflightModel } from '../src/model-preflight.js';
 import { AccountManager } from '../src/account-manager.js';
 import {
@@ -427,4 +427,99 @@ test('a request for an account NAME is called out, with the pin as the remedy', 
   assert.ok(w, 'an id that is really an account name must be named as such');
   assert.match(w.message, /teamclaude run --account deepseek-v4-pro/);
   assert.match(formatExplain(trace), /verdict {5}: NOT ROUTABLE/);
+});
+
+// ── the launch line ───────────────────────────────────────────
+//
+// This is the guard that fires on EVERY launch rather than only on a provable
+// fault, so its contract is mostly about what it must never do: never throw,
+// never claim rules the launch will not run under, never grow past one line.
+
+test('the launch line names route, account, transport and failover depth', () => {
+  const line = launchSummary(fixture(), { model: FABLE });
+  assert.match(line, /model "claude-fable-5"/);
+  assert.match(line, /route "fable"/);
+  assert.match(line, /account "alice"/, 'lowest priority value wins');
+  assert.match(line, /1 more on failover/, 'fugu stands behind alice; disabled kimi-k3 does not count');
+  assert.equal(line.includes('\n'), false, 'one line, always');
+});
+
+test('the launch line shows the upstream and the modelMap rewrite for a third-party account', () => {
+  // alice and bob removed, so fugu is the only candidate and its rewrite shows.
+  const cfg = fixture();
+  cfg.routes = [{ name: 'fable', match: ['*fable*'], accounts: ['fugu'] }];
+  const line = launchSummary(cfg, { model: FABLE });
+  assert.match(line, /account "fugu"/);
+  assert.match(line, /http:\/\/127\.0\.0\.1:8083/, 'the real destination, not "the Anthropic API"');
+  assert.match(line, /as "fugu-2"/, 'the id the upstream actually receives');
+  assert.match(line, /no failover candidate/);
+});
+
+test('a pinned launch says PINNED, names the account, and disclaims rotation', () => {
+  const line = launchSummary(fixture(), { model: FABLE, accountPin: 'fugu' });
+  assert.match(line, /PINNED account "fugu"/);
+  assert.match(line, /as "fugu-2"/);
+  assert.match(line, /no rotation, no failover/);
+  assert.equal(/route "fable"/.test(line), false,
+    'a pin bypasses selection, so naming the route would describe rules this launch does not run under');
+});
+
+test('a pin that resolves to nothing is reported as a total failure, not as routing', () => {
+  const line = launchSummary(fixture(), { model: FABLE, accountPin: 'typo' });
+  assert.match(line, /matches NO account/);
+  assert.match(line, /404/);
+});
+
+test('a direct launch refuses to describe teamclaude routing at all', () => {
+  const line = launchSummary(fixture(), { model: FABLE, routingApplies: false });
+  assert.match(line, /direct launch/);
+  assert.match(line, /routing does not apply/);
+  assert.equal(/account "/.test(line), false,
+    'the proxy is bypassed, so no account claim is truthful');
+});
+
+test('no --model is stated as unknown rather than guessed', () => {
+  const line = launchSummary(fixture(), {});
+  assert.match(line, /no --model/);
+  assert.match(line, /picks its own default/);
+  assert.equal(/route "/.test(line), false, 'the client default is not predictable from config');
+});
+
+test('a blocked model is reported as blocked, naming the pattern', () => {
+  const line = launchSummary(fixture(), { model: 'claude-preview-9' });
+  assert.match(line, /BLOCKED/);
+  assert.match(line, /\*preview\*/);
+});
+
+test('an unroutable id points at explain instead of inventing a destination', () => {
+  const cfg = {
+    accounts: [oauth('alice'), apikey('deepseek-v4-pro', { upstream: 'http://127.0.0.1:8084' })],
+    routes: [{ name: 'default', match: ['*'], accounts: ['alice'] }],
+  };
+  const line = launchSummary(cfg, { model: 'deepseek-v4-pro' });
+  assert.match(line, /NOT ROUTABLE/);
+  assert.match(line, /teamclaude explain deepseek-v4-pro/);
+});
+
+test('the launch line never throws, whatever the config', () => {
+  // It runs on the launch path of every session, so a malformed config must
+  // degrade to a useless line, never to a failed launch.
+  const junk = [null, undefined, {}, { accounts: null, routes: null },
+    { accounts: [{}], routes: [{}] }, { accounts: 'nope', routes: 7 }];
+  for (const cfg of junk) {
+    for (const opts of [{ model: FABLE }, {}, { model: FABLE, accountPin: 'x' }]) {
+      assert.doesNotThrow(() => launchSummary(cfg, opts), `config ${JSON.stringify(cfg)}`);
+    }
+  }
+});
+
+test('the launch line agrees with the full trace about which account serves the request', () => {
+  // The line is a summary of the trace, so a disagreement between them would be
+  // worse than printing neither — pin them to each other.
+  for (const model of [FABLE, OPUS]) {
+    const trace = explainRouting(fixture(), model);
+    const first = trace.candidates.find(c => !c.disabled);
+    assert.match(launchSummary(fixture(), { model }), new RegExp(`account "${first.name}"`),
+      `${model}: the line must name the same first candidate as the trace`);
+  }
 });

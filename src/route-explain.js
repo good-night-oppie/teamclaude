@@ -653,6 +653,93 @@ export function formatExplain(trace, opts = {}) {
   return lines.join('\n');
 }
 
+// ── the launch line ─────────────────────────────────────────
+
+/**
+ * ONE line describing where this launch's traffic will actually go, for
+ * `teamclaude run` to print on EVERY launch — not only when something is wrong.
+ *
+ * This is the cheapest guard in the module and, for the incident that motivated
+ * all of it, the most reliable one. The preflight can only object to what it can
+ * prove is broken; it is silent whenever routing merely differs from what the
+ * operator assumed. That silence is the actual failure mode: a session ran six
+ * minutes on the wrong model and the only signal existed inside the client's own
+ * transcript, where nobody looks. A launch that always states its destination
+ * makes the whole class visible without a veto, without forking another
+ * program's private logic, and without any power to refuse valid work.
+ *
+ * Deliberately one line. A paragraph here would be scrolled past on every launch
+ * and would train operators to ignore exactly the line that matters; `teamclaude
+ * explain <model>` exists for the full trace, and this line names it.
+ *
+ * Quota-blind like the rest of the module: it reports the FIRST candidate the
+ * config implies, which is the account a fresh request tends to get, and says
+ * how many others stand behind it. Live quota can reorder that at request time
+ * (see the trace notes), so the line describes the config, never the moment.
+ *
+ * Pure: returns the string, never prints it, and is written so that no input can
+ * make it throw — the caller still guards, because a launch must never fail
+ * because its narration did.
+ */
+export function launchSummary(config, {
+  model = null, accountPin = null, routingApplies = true, via = [],
+} = {}) {
+  const id = typeof model === 'string' && model ? `"${model}"` : null;
+
+  // A direct launch never consults teamclaude at all, so any route we named
+  // would be a claim about rules this session will not run under.
+  //
+  // `via` keeps that claim honest. A direct launch inherits its parent's
+  // environment, and teamclaude declines to delete a proxy variable it cannot
+  // prove is its own, so "bypassing the proxy" can be true of THIS teamclaude
+  // and false of the environment. Saying "direct" while an inherited HTTPS_PROXY
+  // quietly forwards the session somewhere else would be exactly the silent
+  // wrong-destination this line exists to expose.
+  if (!routingApplies) {
+    const hops = (Array.isArray(via) ? via : []).filter(v => v && v.value);
+    const through = hops.length
+      ? ` — but still via inherited ${hops.map(v => `${(v.names || [])[0] || 'proxy'}=${v.value}`).join(', ')}`
+      : ' — teamclaude routing does not apply';
+    return `${id ? `model ${id}` : 'no --model'} → direct launch, bypassing this proxy${through}`;
+  }
+
+  if (accountPin) {
+    const pin = pinnedRoutabilityOf(config, model, accountPin);
+    const acct = pin.account;
+    if (!acct) return `model ${id ?? '(client default)'} → pin "${accountPin}" matches NO account — every request 404s`;
+    const dest = acct.upstream || 'the Anthropic API';
+    const as = pin.mappedTo ? ` as "${pin.mappedTo}"` : '';
+    const outside = pin.outsideRouting ? ', outside the routing rules' : '';
+    return `${id ? `model ${id}` : 'client default model'} → PINNED account "${acct.name}" (#${acct.index})`
+      + ` → ${dest}${as}${outside} — no rotation, no failover`;
+  }
+
+  // No --model: Claude Code will pick its own default, which teamclaude cannot
+  // predict (the default bypasses the client's own allowlist gate entirely), so
+  // claiming a route here would be a guess presented as fact.
+  if (!id) return 'no --model → Claude Code picks its own default; teamclaude routes whatever it sends';
+
+  const r = routabilityOf(config, model);
+  if (r.blockedBy) return `model ${id} → BLOCKED by blockedModels pattern "${r.blockedBy}" — every request 400s`;
+
+  const live = (r.candidates || []).filter(c => !c.disabled);
+  const first = live[0] || (r.candidates || [])[0] || null;
+  if (!r.routable || !first) {
+    return `model ${id} → NOT ROUTABLE by this config — see: teamclaude explain ${model}`;
+  }
+
+  const raw = (Array.isArray(config?.accounts) ? config.accounts : []).find(a => a?.name === first.name);
+  const dest = raw?.upstream || 'the Anthropic API';
+  const as = first.mappedTo ? ` as "${first.mappedTo}"` : '';
+  const where = r.route ? `route "${r.route.name}"` : 'no route (models[] ownership)';
+  const behind = live.length - 1;
+  const more = behind > 0 ? `, ${behind} more on failover` : ', no failover candidate';
+  const kind = raw?.type || (raw?.apiKey ? 'apikey' : 'oauth');
+
+  return `model ${id} → ${where} → account "${first.name}" (${kind}, prio ${first.priority})`
+    + ` → ${dest}${as}${more}`;
+}
+
 // Greedy wrap; never splits a token, so long model ids and URLs stay intact.
 function wrap(text, width) {
   const words = String(text).split(/\s+/).filter(Boolean);

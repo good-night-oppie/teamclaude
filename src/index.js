@@ -18,11 +18,12 @@ import { TUI } from './tui.js';
 import { SxManager } from './sx.js';
 import { autoUpdate, checkForUpdate, currentVersion, runUpdate, installKind, PKG_NAME } from './updater.js';
 import { renderStatus } from './status-renderer.js';
-import { buildClaudeEnvLines, encodePinComponent } from './claude-env.js';
+import { buildClaudeEnvLines, encodePinComponent, directLaunchEnvPlan } from './claude-env.js';
 import { deriveNamespace } from './model-namespace.js';
-import { explainRouting, formatExplain } from './route-explain.js';
+import { explainRouting, formatExplain, launchSummary } from './route-explain.js';
 import {
-  preflightModel, formatPreflight, splitRunArgs, lastValueFlag, readFlagSettingsModels, RUN_BOOLEAN_FLAGS,
+  preflightModel, formatPreflight, splitRunArgs, lastValueFlag, readFlagSettingsModels, scanModelArgs,
+  RUN_BOOLEAN_FLAGS,
 } from './model-preflight.js';
 import { readAvailableModels } from './claude-settings.js';
 import { checkConfig, formatFindings, doctorExitCode } from './config-doctor.js';
@@ -778,6 +779,10 @@ async function runCommand() {
   // refuse anyway, and reporting both problems at once beats sending the
   // operator round the loop twice — start the server, get refused again.
   const routingApplies = proxyUp || !autoFallback;
+  // Proxy vars a direct launch inherited and deliberately did NOT clear, so the
+  // launch line can qualify its "bypassing the proxy" claim rather than assert
+  // something the environment contradicts.
+  let directLaunchVia = [];
 
   // Fail loud on a model that cannot work. Claude Code will not do this: at
   // launch a refused --model is advisory there — warned in-band, never on
@@ -829,6 +834,19 @@ async function runCommand() {
     }
   } else if (autoFallback) {
     console.error(`[TeamClaude] Proxy not running on port ${port} — launching claude directly (--auto-fallback; start it with: teamclaude server)`);
+    // "Directly" has to be true. The child inherits this shell's environment,
+    // and a teamclaude session's shell is usually one teamclaude set up, so
+    // without this the traffic goes straight back into a proxy — the dead one we
+    // just probed, or worse, a different live one. See directLaunchEnvPlan.
+    const plan = directLaunchEnvPlan(env, port);
+    for (const name of plan.clear) delete env[name];
+    if (plan.clear.length) {
+      console.error(`[TeamClaude] Cleared ${plan.clear.join(', ')} — they pointed at the proxy on port ${port}, which is down; a direct launch must not route through it.`);
+    }
+    for (const { names, value } of plan.remaining) {
+      console.error(`[TeamClaude] NOTE: ${names.join(', ')} = ${value} — set to something that is NOT this proxy, so it is left alone (it may be a corporate egress proxy or another teamclaude). This launch is "direct" only with respect to port ${port}; claude's traffic still traverses that proxy.`);
+    }
+    directLaunchVia = plan.remaining;
     if (accountPin || tcAcct) {
       console.error(`[TeamClaude] account pin (${accountPin ? `--account ${accountPin.name}` : `TC_ACCT=${tcAcct}`}) is IGNORED in a direct launch: the pin is a proxy routing knob, and the proxy is down.`);
     }
@@ -850,6 +868,30 @@ async function runCommand() {
     const API_TIMEOUT_DEFAULT_MS = 600_000;
     const current = parseInt(env.API_TIMEOUT_MS || '0', 10) || API_TIMEOUT_DEFAULT_MS;
     if (current < needed) env.API_TIMEOUT_MS = String(needed);
+  }
+
+  // State where this session's traffic is going, on EVERY launch — the guard
+  // that would have caught the incident this whole path exists for. The
+  // preflight only speaks when it can prove something is broken; it is silent
+  // when routing merely differs from what the operator assumed, which is the
+  // case that actually cost six minutes of wrong-model compute. Printed last so
+  // it reflects the env as finally assembled (pin applied, transport chosen,
+  // direct-launch fallback taken) rather than the intent going in.
+  //
+  // stderr, so a `--print` session's stdout stays pipeable. Wrapped, because a
+  // launch must never fail because its narration did: this line is worth
+  // printing on every launch precisely because it is never load-bearing.
+  if (run.launchLine) {
+    try {
+      const model = scanModelArgs(claudeArgs).effective || process.env.ANTHROPIC_MODEL || null;
+      const line = launchSummary(config, {
+        model,
+        accountPin: accountPin?.token || null,
+        routingApplies: proxyUp,
+        via: directLaunchVia,
+      });
+      if (line) console.error(`[TeamClaude] ${line}`);
+    } catch { /* narration is never load-bearing */ }
   }
 
   // Use spawnSync so the Node process blocks entirely — behaves like execvp.
@@ -1666,6 +1708,8 @@ Options:
   --strict            (run) also block when Claude Code's own availableModels
                       would veto the model; (doctor) exit 3 on warnings too
   --no-preflight      (run) skip the model check before launching claude
+  --no-launch-line    (run) suppress the one-line summary of where this session's
+                      traffic will go, printed on stderr before claude starts
   --claude-settings FILE
                       (doctor) cross-check against this settings file instead of
                       the ones Claude Code would load (read-only, either way)
