@@ -202,6 +202,9 @@ teamclaude disable <name>    # Temporarily exclude an account from rotation
 teamclaude enable <name>     # Re-enable it (also clears a stuck error state)
 teamclaude priority <name> 1 # Set rotation priority (lower = preferred)
 teamclaude route list        # Manage per-model routes (add/rm); see Model routes
+teamclaude models            # Model ids this proxy can route (--json)
+teamclaude explain <model>   # How a request for <model> routes, and why
+teamclaude doctor            # Check the config for dead/conflicting entries (exit 0/2/3)
 teamclaude probe 300         # Enable background quota refresh (off by default)
 teamclaude alias             # Print/install a `claude` alias that routes via the proxy
 teamclaude api <path>        # Call an API endpoint with account credentials
@@ -397,6 +400,69 @@ teamclaude route rm fable
 **Inline markers (TUI).** Instead of a separate list, each route surfaces on the account rows as a colored `►`: next to the **`F7`/`S7`** bar for a Fable/Sonnet route, or at the **start of the row** for a general route (one fixed column per route so its position is stable). The marker is bold on the account a route is pinned to, dim when that account is currently ineligible. `teamclaude status` (the CLI text dump) still prints the routes as a list, now colored and annotated with any pin.
 
 **Manual per-route switching (TUI).** Press **`s`** to switch accounts, then **`←`/`→`** (or **`Tab`**) to choose *what* you're switching: the global **default** account, or a specific **route**. Pick an account with `↑/↓` and **`Enter`** to pin that route to it; `Enter` again on the current pin clears it. Pins are a **runtime preference** — not saved to config — and routing **falls back** to normal best-available selection whenever the pinned account is throttled or over quota, so a pin never stalls requests.
+
+### Model namespace, launch preflight & doctor
+
+Three parties hold a partial copy of the truth "which model ids work": Claude Code's own
+`availableModels` allowlist (client-side, in `~/.claude/settings.json` and its sibling tiers),
+teamclaude's `routes`/`modelMap`/`models` config, and whatever `--model` a launcher happens to
+emit. They drift, and every disagreement degrades **silently** — at launch Claude Code warns
+about a model it will not accept *in-band only* (never on stderr, never fatally) and falls back
+to its default, so a session runs for hours on the wrong model and looks healthy throughout.
+
+```bash
+teamclaude models                  # ids this proxy knows by name (--json)
+teamclaude explain claude-fable-5  # the full routing decision for one id (--json)
+teamclaude doctor                  # config consistency + allowlist drift
+```
+
+- **`models`** — the *enumerable* half of the namespace: `modelMap` keys plus `models[]` claims.
+  It is never the whole list, and says so: route globs match ids that cannot be enumerated, and
+  an account with no custom `upstream` can serve any real Anthropic id that appears nowhere in
+  the config. Ids go to stdout, caveats to stderr, so it pipes.
+- **`explain <model>`** — which route wins and which routes it shadows, which accounts are
+  eligible and why the rest are not, the failover chain, the `modelMap` rewrite each candidate
+  applies, and the config defects the trace proves. `--account <name>` traces the same request
+  under a `/tc-acct` pin. Quota-blind by design: it explains the config, not the live server.
+- **`doctor`** — read-only consistency check. Exit **0** clean, **2** warnings, **3** errors, and
+  **1** when it could not run at all (no config, unreadable file, bad usage), so cron can tell a
+  bad config from a bad invocation. `--strict` treats warnings as errors; `--json` for automation.
+  It reads Claude Code's settings tiers **read-only** and takes nothing from them but
+  `availableModels` — teamclaude never writes `~/.claude/settings.json`.
+
+**Launch preflight.** `teamclaude run` now checks the model *before* it starts claude. Exactly one
+thing blocks a launch — a model this proxy **provably** cannot serve — and everything else warns:
+
+- a model that provably cannot route **blocks** the launch (it is on `blockedModels`; no account
+  may serve it; or it is an account name whose request would egress verbatim and 404). Override
+  with `teamclaude run --force -- …` — `--force` is teamclaude's flag, so it goes **before** the
+  `--`, and the preflight says so when it refuses;
+- a repeated `--model` **warns**, naming both values and the winner (the client keeps the last).
+  It never blocks: appending a second `--model` is how a wrapper expresses an override, so the
+  shape alone proves nothing — the decision rests on whether the *winning* value can route;
+- a model only Claude Code's own allowlist would veto **warns** in one line, since that mirrors
+  one client build and a false negative there would refuse a launch that works — `--strict`
+  promotes it to a block and prints the full remedy list;
+- with `--account <name>` the check is made against **that account**, not the routing table the
+  pin bypasses; the only thing that can block a pinned launch is an unresolved pin or
+  `blockedModels`, and reaching an account the rules would never pick is reported, not refused;
+- with `--auto-fallback` and the proxy **down**, routing findings are skipped entirely: that
+  launch goes straight to the upstream on your own credential, where none of teamclaude's rules
+  apply;
+- `--no-preflight` skips the check entirely.
+
+An **account name is not a model id**. Asking for one reaches whichever account the routing table
+picks, not the account of that name, and the id then egresses verbatim and 404s. To run a whole
+session on one account, pin it:
+
+```bash
+teamclaude run --account deepseek-v4-pro -- --model claude-opus-4-8
+teamclaude env --account deepseek-v4-pro          # same pin, for tools that spawn claude themselves
+```
+
+The pin is the existing `/tc-acct/<name-or-index>` mechanism, now reachable from the normal launch
+path: the session never rotates and never fails over (an exhausted pin returns 429 rather than
+borrowing another account), while non-Anthropic hosts still traverse the forward proxy as usual.
 
 ### Quota probe (optional, off by default)
 
