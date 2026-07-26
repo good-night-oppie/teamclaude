@@ -2,7 +2,7 @@
 
 import { spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { createWriteStream } from 'node:fs';
+import { createWriteStream, readFileSync } from 'node:fs';
 import net from 'node:net';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, loadState, saveState } from './config.js';
 import { AccountManager } from './account-manager.js';
@@ -17,11 +17,49 @@ import { TUI } from './tui.js';
 import { SxManager } from './sx.js';
 import { autoUpdate, checkForUpdate, currentVersion, runUpdate, installKind, PKG_NAME } from './updater.js';
 import { renderStatus } from './status-renderer.js';
-import { buildClaudeEnvLines } from './claude-env.js';
+import { buildClaudeEnvLines, accountPinBaseUrl } from './claude-env.js';
+import { deriveNamespace } from './model-namespace.js';
+import { explainRouting, formatExplain } from './route-explain.js';
+import {
+  preflightModel, formatPreflight, splitRunArgs, lastValueFlag, readFlagSettingsModels, RUN_BOOLEAN_FLAGS,
+} from './model-preflight.js';
+import { readAvailableModels } from './claude-settings.js';
+import { checkConfig, formatFindings, doctorExitCode } from './config-doctor.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
+
+// Usage strings for the multi-form commands. They live ABOVE the dispatch switch
+// rather than beside their handlers because the switch runs during module
+// evaluation: a `const` declared further down is still in its temporal dead zone
+// when a handler reaches it, so `teamclaude route bogus` threw a ReferenceError
+// instead of printing usage. Hoisted function declarations are why the handlers
+// themselves can stay below.
+
+const ROUTE_USAGE = [
+  'Usage: teamclaude route [list]',
+  '       teamclaude route add <name> --match "<glob>[,<glob>]" [--accounts "<name-or-index>[,...]"] [--bucket <quota-bucket>] [--color <name>]',
+  '       teamclaude route rm <name>',
+  '',
+  'A route pins model ids matching its globs to an exclusive set of accounts.',
+  'Omit --accounts to route to all accounts (e.g. just to override --bucket).',
+  '--color (red/green/yellow/blue/magenta/cyan) tints the route\'s inline marker in the TUI.',
+  'First matching route wins. Changes apply to a running server immediately.',
+].join('\n');
+
+const ROUTE_COLORS = ['red', 'green', 'yellow', 'blue', 'magenta', 'cyan'];
+
+const EXPLAIN_USAGE = [
+  'Usage: teamclaude explain <model> [--account <name-or-index>] [--json]',
+  '',
+  'Print the routing decision a request for <model> would follow: blocklist, which',
+  'route wins and which routes it shadows, which accounts are eligible and why the',
+  'rest are not, the failover chain, and the config problems the trace proves.',
+  '--account shows the same trace under a /tc-acct pin (what `run --account` sends).',
+  'Quota-blind and read-only: it explains the config, not the live server.',
+].join('\n');
+
 
 switch (command) {
   case 'server':
@@ -86,6 +124,17 @@ switch (command) {
   case 'routes':
     await routeCommand();
     process.exit(0);
+    break;
+  case 'models':
+    await modelsCommand();
+    process.exit(0);
+    break;
+  case 'explain':
+    await explainCommand();
+    process.exit(0);
+    break;
+  case 'doctor':
+    await doctorCommand();
     break;
   case 'update':
     await updateCommand();
@@ -607,15 +656,29 @@ async function envCommand() {
   const port = config.proxy.port;
   const useMitm = !args.slice(1).includes('--no-mitm');
 
+  // Same --account pin as `run`, validated the same way, so a tool that spawns
+  // claude itself can pin a session too. Validation is not optional here either:
+  // an unresolved pin would 404 on every request of a session that already looks
+  // launched. Both spellings are recognized — an `--account=name` that parsed as
+  // "no pin requested" would print an UNPINNED export line with no warning, and
+  // the caller would eval it believing the shell was pinned.
+  const envAccount = lastValueFlag(args.slice(1), '--account');
+  const accountPin = envAccount.present ? resolveRunAccountPin(config, envAccount.value) : null;
+
   let caPath = null;
   if (useMitm) ({ caPath } = await ensureCerts(upstreamHost(config)));
 
-  const lines = buildClaudeEnvLines({ port, useMitm, caPath, holdSeconds: config.holdSeconds });
+  const lines = buildClaudeEnvLines({
+    port, useMitm, caPath, holdSeconds: config.holdSeconds, accountPin: accountPin?.token || null,
+  });
   process.stdout.write(`${lines.join('\n')}\n`);
 
   const mode = useMitm ? 'MITM forward-proxy' : 'base-URL';
   process.stderr.write(`# TeamClaude env: ${mode} mode, localhost:${port}\n`);
-  process.stderr.write(`# apply to this shell:  eval "$(teamclaude env${useMitm ? '' : ' --no-mitm'})"\n`);
+  if (accountPin) {
+    process.stderr.write(`# pinned to account "${accountPin.name}" (#${accountPin.index}) — no rotation, no failover\n`);
+  }
+  process.stderr.write(`# apply to this shell:  eval "$(teamclaude env${useMitm ? '' : ' --no-mitm'}${accountPin ? ` --account ${accountPin.name}` : ''})"\n`);
   if (!(await isProxyUp(port))) {
     process.stderr.write(`# note: proxy not running on port ${port} — start it with: teamclaude server\n`);
   }
@@ -629,19 +692,34 @@ async function envCommand() {
 async function runCommand() {
   const config = await loadOrCreateConfig();
 
-  // Args after 'run'. teamclaude flags (e.g. --no-mitm) are recognized only
-  // before an optional `--` separator; everything after `--` goes verbatim to
+  // Args after 'run'. teamclaude flags (e.g. --no-mitm, --account) are recognized
+  // only before an optional `--` separator; everything after `--` goes verbatim to
   // claude. MITM forward-proxy mode is the default so hardcoded api.anthropic.com
   // endpoints are intercepted too; --no-mitm opts back into base-URL-only routing.
   // --mitm is still accepted (now a no-op) for backward compatibility.
-  const rest = args.slice(1);
-  const sep = rest.indexOf('--');
-  const tcFlags = sep >= 0 ? rest.slice(0, sep) : rest;
-  const useMitm = !tcFlags.includes('--no-mitm');
-  const autoFallback = tcFlags.includes('--auto-fallback');
-  const claudeArgs = sep >= 0
-    ? rest.slice(sep + 1)
-    : rest.filter(a => a !== '--mitm' && a !== '--no-mitm' && a !== '--auto-fallback');
+  const run = splitRunArgs(args.slice(1));
+  const useMitm = run.useMitm;
+  const autoFallback = run.autoFallback;
+  const claudeArgs = run.claudeArgs;
+
+  // An unrecognized flag BEFORE the `--` is provably a mistake: in the separated
+  // form that slice is exclusively teamclaude's, and until now anything we did
+  // not know was dropped without a word — which is how `--account=work` launched
+  // an unpinned session that the operator believed was pinned. (In the
+  // unseparated form an unknown flag is claude's by construction, so this only
+  // ever fires on the separated one, where the fleet aliases pass nothing at all.)
+  if (run.unknownFlags.length) {
+    console.error(`[TeamClaude] Unknown flag(s) for 'teamclaude run': ${run.unknownFlags.join(', ')}`);
+    console.error(`Valid flags before the --: ${[...RUN_BOOLEAN_FLAGS, '--account <name>'].join(', ')}`);
+    console.error('Everything after the -- is passed to claude verbatim.');
+    process.exit(1);
+  }
+
+  // --account <name> pins the whole session to one account via /tc-acct. Resolve
+  // it before anything else so a typo costs nothing: an unknown pin would
+  // otherwise reach the server as a 404 on the FIRST request, i.e. after claude
+  // has already started and the operator has stopped watching.
+  const accountPin = run.accountRequested ? resolveRunAccountPin(config, run.account) : null;
 
   // Route through the proxy when it's up. When it's down we refuse by default —
   // silently launching claude directly hides that requests are bypassing the
@@ -649,7 +727,25 @@ async function runCommand() {
   // opt back into the transparent direct launch (e.g. for a dumb shell alias).
   const port = config.proxy.port;
   const env = { ...process.env };
-  if (await isProxyUp(port)) {
+  // Probed BEFORE the preflight, not after: with the proxy down --auto-fallback
+  // launches claude straight at the upstream, where teamclaude's routing table
+  // governs nothing — so refusing that launch on routing grounds would refuse a
+  // session that works, on rules it will never consult. The preflight is told
+  // which rules apply instead of assuming they all do.
+  const proxyUp = await isProxyUp(port);
+  // Routing governs this launch unless it is the direct one. Note the second
+  // clause: with the proxy down and NO --auto-fallback the run is about to
+  // refuse anyway, and reporting both problems at once beats sending the
+  // operator round the loop twice — start the server, get refused again.
+  const routingApplies = proxyUp || !autoFallback;
+
+  // Fail loud on a model that cannot work. Claude Code will not do this: at
+  // launch a refused --model is advisory there — warned in-band, never on
+  // stderr, never fatal — so the only place a bad model can still be made
+  // visible is here, before the process is replaced. --no-preflight skips it.
+  if (run.preflight) runPreflight({ config, run, accountPin, routingApplies });
+
+  if (proxyUp) {
     if (useMitm) {
       // Route ALL of claude's traffic through us as an HTTPS forward proxy, so
       // even hardcoded api.anthropic.com endpoints (e.g. the design MCP) get the
@@ -660,15 +756,29 @@ async function runCommand() {
       env.HTTPS_PROXY = env.HTTP_PROXY = env.https_proxy = env.http_proxy = proxyUrl;
       env.NO_PROXY = env.no_proxy = 'localhost,127.0.0.1,::1';
       env.NODE_EXTRA_CA_CERTS = caPath;
-      delete env.ANTHROPIC_BASE_URL;
+      // A pin needs ANTHROPIC_BASE_URL to carry it, and 127.0.0.1 is in NO_PROXY,
+      // so the pinned hop goes straight to the listener in the origin form the
+      // /tc-acct branch matches while every other host still traverses the MITM.
+      // Clearing the variable here would immediately undo the pin — hence the
+      // branch. See src/claude-env.js for the full reasoning.
+      if (accountPin) env.ANTHROPIC_BASE_URL = accountPinBaseUrl(port, accountPin.token);
+      else delete env.ANTHROPIC_BASE_URL;
     } else {
       // Only set ANTHROPIC_BASE_URL — Claude Code keeps its own OAuth token
       // which the proxy accepts from localhost. Not setting ANTHROPIC_API_KEY
       // lets Claude Code stay in subscription mode (full model access).
-      env.ANTHROPIC_BASE_URL = `http://localhost:${port}`;
+      env.ANTHROPIC_BASE_URL = accountPin
+        ? accountPinBaseUrl(port, accountPin.token)
+        : `http://localhost:${port}`;
+    }
+    if (accountPin) {
+      console.error(`[TeamClaude] Pinned to account "${accountPin.name}" (#${accountPin.index}) via /tc-acct — this session will not rotate and will not fail over; an exhausted pin returns 429 rather than borrowing another account.`);
     }
   } else if (autoFallback) {
     console.error(`[TeamClaude] Proxy not running on port ${port} — launching claude directly (--auto-fallback; start it with: teamclaude server)`);
+    if (accountPin) {
+      console.error(`[TeamClaude] --account ${accountPin.name} is IGNORED in a direct launch: the pin is a proxy URL prefix, and the proxy is down.`);
+    }
   } else {
     console.error(`[TeamClaude] Proxy not running on port ${port}.`);
     console.error('Start it with: teamclaude server');
@@ -711,6 +821,218 @@ async function runCommand() {
   await autoUpdate({ config }).catch(() => {});
 
   process.exit(result.status ?? 1);
+}
+
+// Resolve `run --account <token>` the same way the server resolves a /tc-acct
+// path segment (resolveAccountPin, server.js:148-156): exact name first, then
+// numeric index. Exits non-zero with the valid NAMES on no match — names only,
+// never a token, key, or email-derived credential.
+function resolveRunAccountPin(config, token) {
+  const accounts = config.accounts || [];
+  const names = accounts.map(a => a.name);
+  const bail = (msg) => {
+    console.error(msg);
+    console.error(names.length
+      ? `Valid accounts: ${names.join(', ')}`
+      : 'No accounts are configured. Add one with: teamclaude login');
+    console.error('Or address one by index: --account 0 (same order as: teamclaude accounts)');
+    process.exit(1);
+  };
+
+  if (!token) bail('--account needs an account name or index, e.g. --account work');
+
+  const byName = accounts.findIndex(a => a.name === token);
+  if (byName >= 0) return { token, index: byName, name: accounts[byName].name };
+  if (/^\d+$/.test(token)) {
+    const i = Number(token);
+    if (i >= 0 && i < accounts.length) return { token, index: i, name: accounts[i].name };
+    bail(`--account ${token}: index out of range (${accounts.length} account(s) configured).`);
+  }
+  bail(`No account named "${token}".`);
+}
+
+// The fail-loud launch check. Reads Claude Code's settings tiers READ-ONLY and
+// takes nothing from them but the availableModels array; the decision itself is
+// pure and lives in model-preflight.js. Prints to stderr so a `--print` session's
+// stdout stays clean, and exits 1 rather than spawning when a model provably
+// cannot route (the asymmetry between that and the advisory client-gate warning
+// is argued in model-preflight.js's header).
+//
+// `accountPin` and `routingApplies` are what keep the check honest about WHICH
+// rules govern the launch it is judging. A pinned session bypasses selection
+// entirely, and a proxy-down --auto-fallback launch bypasses teamclaude
+// entirely; in neither case may the unpinned routing table refuse anything.
+//
+// The `--settings` scan is the same read-only discipline one level further out:
+// that flag is a settings tier too, and its availableModels union in, so a
+// client-allowlist veto computed without it can assert a fallback that provably
+// will not happen — and then recommend, as the fix, the flag already present in
+// the command line it just judged.
+function runPreflight({ config, run, accountPin = null, routingApplies = true }) {
+  const settings = readAvailableModels();
+  for (const e of settings.errors) {
+    console.error(`[TeamClaude] WARNING: could not parse ${e.path} (${e.message}) — its availableModels entries were skipped.`);
+  }
+  const decision = preflightModel({
+    config,
+    claudeArgs: run.claudeArgs,
+    envModel: process.env.ANTHROPIC_MODEL || null,
+    availableModels: settings.availableModels,
+    flagSettings: readFlagSettingsModels(run.claudeArgs, p => readFileSync(p, 'utf8')),
+    policyOverride: settings.policyOverride,
+    accountPin,
+    routingApplies,
+    misplacedFlags: run.misplacedFlags,
+    force: run.force,
+    strict: run.strict,
+  });
+  for (const line of formatPreflight(decision)) console.error(`[TeamClaude] ${line}`);
+  if (decision.blocked) process.exit(1);
+}
+
+// ── models ──────────────────────────────────────────────────
+
+// `teamclaude models [--json]` — the model ids this proxy can actually route.
+// A query command: loadConfig (never loadOrCreateConfig, which would print and
+// write), payload on stdout, every caveat on stderr so the list stays pipeable.
+// The list is deliberately NOT presented as complete — that framing is what
+// produced the incident this branch exists for — so the un-enumerable half
+// (route globs, passthrough accounts) is printed beside it, not instead of it.
+async function modelsCommand() {
+  const config = await loadConfig();
+  if (!config) {
+    process.stderr.write(`No config found at ${getConfigPath()}. Add an account first: teamclaude login\n`);
+    process.exit(1);
+  }
+  const ns = deriveNamespace(config);
+
+  if (args.includes('--json')) {
+    process.stdout.write(`${JSON.stringify(ns, null, 2)}\n`);
+    return;
+  }
+
+  if (ns.concrete.length) {
+    process.stdout.write(`${ns.concrete.join('\n')}\n`);
+  } else {
+    process.stderr.write('# no model id is named anywhere in this config (no modelMap keys, no models[] claims)\n');
+  }
+  if (ns.patterns.length) {
+    process.stderr.write(`# ${ns.patterns.length} glob pattern(s) also match, and cannot be enumerated: ${ns.patterns.join(', ')}\n`);
+  }
+  for (const note of ns.notes) {
+    for (const line of wrapForStderr(note, 96)) process.stderr.write(`# ${line}\n`);
+  }
+  process.stderr.write('# check any single id, listed or not:  teamclaude explain <model>\n');
+}
+
+// ── explain ─────────────────────────────────────────────────
+
+async function explainCommand() {
+  const model = args[1] && !args[1].startsWith('-') ? args[1] : null;
+  if (!model) {
+    console.error(EXPLAIN_USAGE);
+    process.exit(1);
+  }
+  const config = await loadConfig();
+  if (!config) {
+    console.error(`No config found at ${getConfigPath()}. Add an account first: teamclaude login`);
+    process.exit(1);
+  }
+  const trace = explainRouting(config, model, { account: lastValueFlag(args.slice(1), '--account').value });
+  if (args.includes('--json')) {
+    process.stdout.write(`${JSON.stringify(trace, null, 2)}\n`);
+    return;
+  }
+  console.log(formatExplain(trace));
+}
+
+// ── doctor ──────────────────────────────────────────────────
+
+// `teamclaude doctor` — a read-only consistency check over the config, plus an
+// optional cross-check against Claude Code's own availableModels allowlist. It
+// exists to be run unattended, so it exits with a code that distinguishes
+// outcomes instead of the repo's usual 0/1: 0 clean, 2 warnings, 3 errors, and
+// 1 for "could not run at all". That deviation is deliberate and documented in
+// showHelp — automation must be able to tell a bad config from a bad invocation.
+// Never writes anything: not the teamclaude config, and certainly not Claude
+// Code's settings, which are opened read-only and yield nothing but the
+// availableModels array.
+async function doctorCommand() {
+  const json = args.includes('--json');
+  const strict = args.includes('--strict');
+  const config = await loadConfig();
+  if (!config) {
+    console.error(`No config found at ${getConfigPath()}. Add an account first: teamclaude login`);
+    process.exit(1);
+  }
+
+  const settingsPath = argValue('--claude-settings');
+  let settings;
+  try {
+    settings = settingsPath
+      ? readAvailableModelsFromFile(settingsPath)
+      : readAvailableModels();
+  } catch (err) {
+    console.error(`Cannot read ${settingsPath}: ${err?.message || err}`);
+    process.exit(1);
+  }
+
+  const findings = checkConfig(config, {
+    availableModels: settings.availableModels,
+    settingsSources: settings.sources,
+  });
+  const code = doctorExitCode(findings, { strict });
+
+  if (json) {
+    process.stdout.write(`${JSON.stringify({
+      exitCode: code,
+      findings,
+      clientAllowlist: {
+        entries: settings.availableModels ? settings.availableModels.length : null,
+        sources: settings.sources.map(s => ({ tier: s.tier, path: s.path, count: s.count })),
+        policyOverride: settings.policyOverride,
+        errors: settings.errors,
+      },
+    }, null, 2)}\n`);
+    process.exit(code);
+  }
+
+  for (const e of settings.errors) console.error(`Warning: could not parse ${e.path} (${e.message})`);
+  console.log(`Config: ${getConfigPath()}`);
+  console.log(settings.sources.length
+    ? `Claude Code allowlist: ${settings.availableModels.length} entry(ies) from ${settings.sources.map(s => s.path).join(', ')}${settings.policyOverride ? ' (managed policy replaced the union)' : ''}`
+    : 'Claude Code allowlist: not configured in any settings tier (the client admits any model id)');
+  console.log('');
+  console.log(formatFindings(findings, { strict }).join('\n'));
+  process.exit(code);
+}
+
+// A single settings file named explicitly, for checking a config that is not
+// this host's. Same contract as readAvailableModels: availableModels only.
+function readAvailableModelsFromFile(path) {
+  const parsed = JSON.parse(readFileSync(path, 'utf8'));
+  const list = parsed && Array.isArray(parsed.availableModels)
+    ? parsed.availableModels.filter(m => typeof m === 'string')
+    : null;
+  return {
+    availableModels: list,
+    sources: list ? [{ tier: 'explicit', path, count: list.length }] : [],
+    errors: [],
+    policyOverride: false,
+  };
+}
+
+// Greedy wrap for the `#`-prefixed stderr commentary; never splits a token.
+function wrapForStderr(text, width) {
+  const words = String(text).split(/\s+/).filter(Boolean);
+  const out = [];
+  let line = words.shift() || '';
+  for (const w of words) {
+    if (line.length + 1 + w.length > width) { out.push(line); line = w; }
+    else line += ` ${w}`;
+  }
+  out.push(line);
+  return out;
 }
 
 // ── status ──────────────────────────────────────────────────
@@ -1073,19 +1395,6 @@ async function removeCommand() {
 
 // ── route ───────────────────────────────────────────────────
 
-const ROUTE_USAGE = [
-  'Usage: teamclaude route [list]',
-  '       teamclaude route add <name> --match "<glob>[,<glob>]" [--accounts "<name-or-index>[,...]"] [--bucket <quota-bucket>] [--color <name>]',
-  '       teamclaude route rm <name>',
-  '',
-  'A route pins model ids matching its globs to an exclusive set of accounts.',
-  'Omit --accounts to route to all accounts (e.g. just to override --bucket).',
-  '--color (red/green/yellow/blue/magenta/cyan) tints the route\'s inline marker in the TUI.',
-  'First matching route wins. Changes apply to a running server immediately.',
-].join('\n');
-
-const ROUTE_COLORS = ['red', 'green', 'yellow', 'blue', 'magenta', 'cyan'];
-
 function splitList(value) {
   return (value || '').split(',').map(s => s.trim()).filter(Boolean);
 }
@@ -1235,14 +1544,18 @@ Commands:
   login --api         Add an API key account
   env [--no-mitm]     Print export lines to point Claude Code at the proxy, for
                       'eval "$(teamclaude env)"' (MITM forward-proxy by default;
-                      --no-mitm for base-URL only). Handy for agent multiplexers
-                      that spawn claude themselves instead of via 'teamclaude run'
-  run [--no-mitm] [--auto-fallback] [-- args...]
+                      --no-mitm for base-URL only; --account <name> to pin).
+                      Handy for agent multiplexers that spawn claude themselves
+                      instead of via 'teamclaude run'
+  run [--account <name>] [--no-mitm] [--auto-fallback] [-- args...]
                       Run Claude Code through the proxy (errors if it's down,
                       unless --auto-fallback launches claude directly instead).
                       Routes via an HTTPS forward proxy + local CA by default, so
                       even hardcoded api.anthropic.com endpoints are intercepted;
-                      --no-mitm uses base-URL routing only
+                      --no-mitm uses base-URL routing only.
+                      --account pins the whole session to one account (no
+                      rotation, no failover), and the model in '-- --model <id>'
+                      is checked before claude starts
   alias               Print a shell alias so plain 'claude' routes via the proxy
                       (--install to write it to your shell rc; --uninstall to remove)
   status [--json]     Show rich proxy/account/probe status (live)
@@ -1254,6 +1567,17 @@ Commands:
   priority <name> <n> Set rotation priority (lower = preferred; --first/--last)
   route [list|add|rm] Per-model routing: pin model globs to specific accounts
                       (add <name> --match "<glob>" [--accounts "<name>"] [--bucket <b>])
+  models [--json]     List the model ids this proxy can actually route, derived
+                      from routes, per-account 'models' claims, and modelMap keys
+                      (never a complete list — globs and passthrough accounts
+                      serve ids that appear nowhere in the config)
+  explain <model>     Show how a request for <model> would route: which route
+                      wins, which routes it shadows, which accounts are eligible
+                      and why the rest are not, and the failover chain
+                      (--account <name> traces it under a pin; --json)
+  doctor [--json]     Check routes, modelMap keys, models[] claims and Claude
+                      Code's availableModels for dead or conflicting config
+                      (--strict, --claude-settings <file>; exit codes below)
   probe [off|secs]    Opt-in background quota refresh for idle accounts
                       (off by default; reads usage endpoint, spends no quota)
   warmup [off|secs]   Opt-in: keep idle accounts' 5h timers running by sending
@@ -1276,9 +1600,37 @@ Options:
   --no-mitm           (run) skip the forward proxy; route via ANTHROPIC_BASE_URL only
   --auto-fallback     (run) if the proxy is down, launch claude directly instead
                       of erroring out (bypasses the proxy: no rotation)
+  --account NAME      (run/env) pin the session to one account via /tc-acct — no
+                      rotation, no failover (account name or index; --account=N
+                      works too). A pinned launch is checked against THAT
+                      account, not the routing rules the pin bypasses
+  --force             (run) launch anyway despite the one blocking preflight
+                      finding (a model that provably cannot route). teamclaude's
+                      own flag, so it must come BEFORE the '--' separator
+  --strict            (run) also block when Claude Code's own availableModels
+                      would veto the model; (doctor) exit 3 on warnings too
+  --no-preflight      (run) skip the model check before launching claude
+  --claude-settings FILE
+                      (doctor) cross-check against this settings file instead of
+                      the ones Claude Code would load (read-only, either way)
 
 The server always accepts both base-URL and proxy/CONNECT clients, so instances
 launched with and without --no-mitm can share one server.
+
+'run' checks the model before it starts claude, because Claude Code will not: a
+--model it refuses is advisory at launch — warned in-band, never on stderr,
+never fatal — so a session silently runs on the default model instead. Exactly
+ONE thing blocks a launch: a model this proxy provably cannot serve (--force
+overrides, before the '--'). A repeated --model warns and names the winner but
+never blocks — a wrapper appending a second one is how an override is expressed.
+A model only Claude Code's own allowlist would veto warns in one line, since
+that mirrors one client build (--strict promotes it). An account name is not a
+model id — use --account, which is also what the preflight then checks against.
+
+'doctor' exits 0 clean, 2 warnings, 3 errors, and 1 when it could not run at all
+(no config, unreadable file, bad usage), so a cron job can tell a bad config
+from a bad invocation. teamclaude never writes ~/.claude/settings.json; doctor
+opens it read-only and reads nothing from it but availableModels.
 
 A running server re-syncs accounts from config on POST /teamclaude/reload
 (local only). add/login/enable/disable/priority trigger it automatically.

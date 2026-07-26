@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildClaudeEnvLines } from '../src/claude-env.js';
+import { buildClaudeEnvLines, accountPinBaseUrl } from '../src/claude-env.js';
 
 test('MITM mode (default) emits proxy vars + CA cert, and clears ANTHROPIC_BASE_URL', () => {
   const lines = buildClaudeEnvLines({ port: 3456, caPath: '/home/u/.config/teamclaude-ca.pem' });
@@ -43,4 +43,83 @@ test('holdSeconds > 0 adds API_TIMEOUT_MS = holdSeconds + 60s, in both modes', (
 test('holdSeconds 0 / unset adds no API_TIMEOUT_MS', () => {
   const lines = buildClaudeEnvLines({ port: 3456, useMitm: false });
   assert.ok(!lines.some((l) => l.startsWith('export API_TIMEOUT_MS')));
+});
+
+// ── account pinning (/tc-acct/<name-or-index>) ──────────────
+
+test('an account pin in MITM mode keeps the proxy vars and replaces the unset with the pinned base URL', () => {
+  const lines = buildClaudeEnvLines({ port: 3456, caPath: '/ca.pem', accountPin: 'work' });
+  assert.deepEqual(lines, [
+    'export HTTPS_PROXY=http://127.0.0.1:3456',
+    'export HTTP_PROXY=http://127.0.0.1:3456',
+    'export https_proxy=http://127.0.0.1:3456',
+    'export http_proxy=http://127.0.0.1:3456',
+    'export NO_PROXY=localhost,127.0.0.1,::1',
+    'export no_proxy=localhost,127.0.0.1,::1',
+    'export NODE_EXTRA_CA_CERTS=/ca.pem',
+    "export ANTHROPIC_BASE_URL='http://127.0.0.1:3456/tc-acct/work'",
+  ]);
+  // The pin would be undone by the unset, so the unset must be gone; the MITM
+  // lines stay so non-claude callers of api.anthropic.com are still intercepted.
+  assert.ok(!lines.includes('unset ANTHROPIC_BASE_URL'), 'unset would clear the pin');
+});
+
+test('an account pin in --no-mitm mode replaces the plain base URL, adding no proxy/cert vars', () => {
+  const lines = buildClaudeEnvLines({ port: 8080, useMitm: false, accountPin: 'work' });
+  assert.deepEqual(lines, ["export ANTHROPIC_BASE_URL='http://127.0.0.1:8080/tc-acct/work'"]);
+});
+
+test('no account pin leaves both modes exactly as they were (unset in MITM, plain base URL otherwise)', () => {
+  for (const pin of [null, undefined, '']) {
+    const mitm = buildClaudeEnvLines({ port: 3456, caPath: '/ca.pem', accountPin: pin });
+    assert.ok(mitm.includes('unset ANTHROPIC_BASE_URL'), `unset missing for pin=${JSON.stringify(pin)}`);
+    assert.ok(!mitm.some((l) => l.includes('/tc-acct/')), 'no pin must not emit a /tc-acct URL');
+
+    const base = buildClaudeEnvLines({ port: 3456, useMitm: false, accountPin: pin });
+    assert.deepEqual(base, ['export ANTHROPIC_BASE_URL=http://localhost:3456']);
+  }
+});
+
+test('an account name with spaces, parens and quotes is percent-encoded down to shell-inert characters', () => {
+  // encodeURIComponent alone leaves !'()* — all shell-special, and real account
+  // names carry them (the README's own example is "work (Acme)").
+  const lines = buildClaudeEnvLines({ port: 3456, useMitm: false, accountPin: "work (Acme)'s a/b!*" });
+  const url = lines[0].slice("export ANTHROPIC_BASE_URL='".length, -1);
+  assert.equal(url, 'http://127.0.0.1:3456/tc-acct/work%20%28Acme%29%27s%20a%2Fb%21%2A');
+  const token = url.split('/tc-acct/')[1];
+  assert.match(token, /^[A-Za-z0-9\-_.~%]+$/, 'token must reduce to unreserved chars + %');
+  assert.ok(!token.includes('/'), 'an encoded token can never split the /tc-acct path segment');
+  // The server round-trips it with decodeURIComponent.
+  assert.equal(decodeURIComponent(token), "work (Acme)'s a/b!*");
+});
+
+test('the pinned base URL is single-quoted so an eval of the env output cannot break out', () => {
+  const lines = buildClaudeEnvLines({ port: 3456, useMitm: false, accountPin: "a';rm -rf /;'" });
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /^export ANTHROPIC_BASE_URL='[^']*'$/, 'exactly one quoted value, no embedded quote');
+  assert.ok(!lines[0].includes('rm -rf /'), 'metacharacters must not survive encoding');
+});
+
+test('a pin composes with holdSeconds and still never emits ANTHROPIC_API_KEY', () => {
+  const lines = buildClaudeEnvLines({ port: 3456, caPath: '/ca.pem', holdSeconds: 3600, accountPin: 'work' });
+  assert.ok(lines.includes('export API_TIMEOUT_MS=3660000'));
+  assert.ok(lines.some((l) => l.includes('/tc-acct/work')));
+  for (const l of lines) assert.ok(!l.includes('ANTHROPIC_API_KEY'), l);
+});
+
+test('accountPinBaseUrl builds the /tc-acct URL on 127.0.0.1, and returns null when there is no pin', () => {
+  assert.equal(accountPinBaseUrl(3456, 'work'), 'http://127.0.0.1:3456/tc-acct/work');
+  assert.equal(accountPinBaseUrl(8080, 'work (Acme)'), 'http://127.0.0.1:8080/tc-acct/work%20%28Acme%29');
+  for (const pin of [null, undefined, '']) assert.equal(accountPinBaseUrl(3456, pin), null, JSON.stringify(pin));
+});
+
+test('a numeric account index pins like keep-warm does — index 0 is a pin, not a missing one', () => {
+  assert.equal(accountPinBaseUrl(3456, 0), 'http://127.0.0.1:3456/tc-acct/0');
+  assert.equal(accountPinBaseUrl(3456, '0'), 'http://127.0.0.1:3456/tc-acct/0');
+  const lines = buildClaudeEnvLines({ port: 3456, useMitm: false, accountPin: 0 });
+  assert.deepEqual(lines, ["export ANTHROPIC_BASE_URL='http://127.0.0.1:3456/tc-acct/0'"]);
+});
+
+test('a whitespace-only pin is kept, not silently dropped — the server answers it with a loud 404', () => {
+  assert.equal(accountPinBaseUrl(3456, ' '), 'http://127.0.0.1:3456/tc-acct/%20');
 });
