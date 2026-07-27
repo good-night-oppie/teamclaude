@@ -478,3 +478,17 @@ test('anything that would depend on Claude Code\'s private alias table is report
   assert.equal(clientAllowlistVerdict({ availableModels: [] }, 'deepseek-v4-pro').allowed, true);
   assert.equal(clientAllowlistVerdict(AVAILABLE_17, '').allowed, true);
 });
+
+test('a pin to a strict closed adapter is unroutable when the model cannot be translated', () => {
+  const config = {
+    accounts: [{
+      name: 'deepseek', type: 'apikey', upstream: 'http://127.0.0.1:8085',
+      strictModelMap: true, acceptsModels: ['deepseek-v4-pro'],
+      modelMap: { good: 'deepseek-v4-pro' },
+    }],
+  };
+  assert.equal(pinnedRoutabilityOf(config, 'good', 'deepseek').routable, true);
+  const bad = pinnedRoutabilityOf(config, 'missing', 'deepseek');
+  assert.equal(bad.routable, false);
+  assert.match(bad.reason, /non-retryable 400/);
+});

@@ -348,6 +348,7 @@ When on, teamclaude routes each **new** session to the least-loaded eligible acc
 | `warmupSeconds` | Keep-warm interval in seconds (`0` = off, the default; CLI `warmup`). Spawns a minimal `claude` per idle account to start its 5h timer — **spends a little quota**, unlike the probe |
 | `holdSeconds` | Maximum seconds to hold the connection when all accounts are exhausted, polling silently until one recovers (`0` = return 429 immediately, the default). `teamclaude run` raises `API_TIMEOUT_MS` automatically to match |
 | `distributeSessions` | Spread concurrent Claude Code sessions across equal-priority accounts, each session pinned to one account for cache reuse (`false` = quota-driven rotation only, the default). Session tracking/readout is always on regardless — see [Session-aware routing](#session-aware-routing-distributesessions-off-by-default) |
+| `routingPolicy` | Selection policy: `{ "mode": "priority-first" | "shadow" | "dynamic", "preserveSessionAffinity": true, "reevaluateMs": 300000 }`. `priority-first` is backward-compatible. `shadow` serves legacy choices while recording old→dynamic disagreements in `/teamclaude/status`. `dynamic` ranks by per-route tier, complete weekly reset, complete session reset, utilization, then priority; known sessions stay pinned for prompt-cache locality. See [Dynamic use-or-lose routing](#dynamic-use-or-lose-routing). |
 | `eventLogging` | How to handle Claude Code's telemetry (`/api/event_logging/*`), which is high-volume activity-log noise: `hide` (default) forwards it but keeps it out of the activity log; `block` answers `200` locally without forwarding (no upstream round-trip); `show` forwards and displays it. Toggle live in the TUI settings screen (`g` → Event logging). |
 | `blockedModels` | Array of model glob patterns (e.g. `["*fable*"]`) whose requests are rejected with a fast, non-retryable `400` instead of being forwarded — avoids a model no account can serve getting rate-limited upstream and hanging the pipeline (issue #116). Edit live in the TUI settings screen (`g` → Blocked models). Empty (the default) blocks nothing. |
 | `stormRamp` | Optional storm-control tuning (on by default) — see [Storm control](#storm-control-switchover-ramp-up). Object: `{ enabled, startConc, stepConc, stepMs, windowMs }` |
@@ -355,12 +356,57 @@ When on, teamclaude routes each **new** session to the least-loaded eligible acc
 | `sx.mode` | `always` (route all upstream traffic), `429` (direct, fail over to the proxy after a 429), or `off` (keep the key but don't use it). Defaults to `always` when a key is set |
 | `accounts[].accountUuid` | Anthropic account (person) id; set automatically from the OAuth profile |
 | `accounts[].orgUuid` / `orgName` | Organization the account is scoped to — lets one email hold multiple org accounts |
-| `accounts[].priority` | Rotation preference, lower = preferred (default 0) |
+| `accounts[].priority` | Static selection preference, lower = preferred (default 0). In `dynamic` mode it is only the final deterministic tie-break after route tier + quota evidence; it no longer suppresses expiration-first ranking. |
+| `accounts[].costTier` | Backward-compatible hard economic tier for routes that do not declare `tiers` (lower = cheaper/preferred). Prefer per-route tiers for heterogeneous model quality/cost. |
+| `accounts[].acceptsModels` | Optional finite list of backend model ids a closed custom adapter accepts. Used with `strictModelMap` to prevent selecting a provider that would hard-400 an untranslated wire id. |
+| `accounts[].strictModelMap` | When true, every requested wire id must appear in `modelMap`, and the mapped target must be in `acceptsModels` when that list is present. Capability failure removes the account before selection; it is never discovered as a non-retryable 400. |
 | `accounts[].disabled` | If `true`, the account is excluded from rotation until re-enabled |
 | `accounts[].upstream` | Alternative upstream base URL for this account (e.g. `https://api.deepseek.com/anthropic`). Overrides the global `upstream` for this account only |
 | `accounts[].modelMap` | Object mapping Anthropic model names to this backend's model names (e.g. `{"claude-sonnet-4-6": "deepseek-v4-pro[1m]"}`). Applied automatically when requests are routed to this account |
 | `accounts[].models` | Array of model names this account exclusively handles. When any account declares a `models` list, requests for those models are routed only to accounts that list them — use this to reserve a third-party account for sessions that pass `--model <name>` explicitly |
 | `routes` | Optional list of routing rules that pin model patterns to specific accounts — see [Model routes](#model-routes) |
+
+### Dynamic use-or-lose routing
+
+Static account priority is simple but wastes subscription quota that resets sooner. Set
+`routingPolicy.mode` to `shadow` first: TeamClaude serves the legacy choice and computes the
+dynamic choice in parallel, exposing disagreement counts and the last old→new decision from
+`GET /teamclaude/status`. Once the evidence matches your intended tiers, promote to `dynamic`.
+
+Dynamic ordering is deliberately **not one global score**. A route's ordered `tiers` are hard
+cost/model-quality boundaries. Inside the first tier with an eligible account, TeamClaude ranks:
+
+1. complete model-specific/shared weekly window whose reset is soonest;
+2. complete 5-hour/session window whose reset is soonest;
+3. lowest measured utilization (unknown ranks last — never as “0% used”);
+4. static `priority`, then active-session/in-flight load and config order as deterministic ties.
+
+Known Claude Code sessions stay on their account for up to the existing one-hour affinity TTL,
+so a reset-time change does not throw away a warm prompt cache. New sessions, failed/exhausted
+sessions, and no-session traffic at the bounded `reevaluateMs` cadence use the new rank.
+
+```json
+{
+  "routingPolicy": { "mode": "shadow", "preserveSessionAffinity": true, "reevaluateMs": 300000 },
+  "routes": [{
+    "name": "fable",
+    "match": ["*fable*"],
+    "tiers": [
+      { "name": "claude-subscriptions", "accounts": ["work-a", "work-b"] },
+      { "name": "native-fugu",          "accounts": ["sakana-fugu"] },
+      { "name": "codex-subscription",   "accounts": ["codex-gpt56"] },
+      { "name": "pay-as-you-go",        "accounts": ["kimi-k3", "deepseek-v4-pro"] }
+    ]
+  }]
+}
+```
+
+Custom adapter health is passive and provider-specific: connection failures and 502/503/504
+open a bounded exponential circuit (2s→60s) and fail over before client headers; a successful
+response heals it. Arbitrary 4xx remain non-retryable — use `acceptsModels` + `strictModelMap`
+to eliminate known model incompatibilities before selection rather than spraying bad requests
+across providers. `/teamclaude/status` exposes quota, circuit state, EWMA latency, policy and
+shadow evidence.
 
 ### Model routes
 
@@ -376,7 +422,8 @@ To go further you can pin model patterns to an **exclusive** set of accounts wit
 ```
 
 - **`match`** — one or more model globs; the first route whose globs match wins.
-- **`accounts`** — account names (or indices) that may serve matching models. **Exclusive**: only these are used (and they 429/rotate among themselves when spent). Omit to route to all accounts — e.g. to only set a `bucket` override.
+- **`accounts`** — account names (or indices) that may serve matching models. **Exclusive**: only these are used (and they 429/rotate among themselves when spent). Omit to route to all accounts — e.g. to only set a `bucket` override. Ignored when `tiers` is present; the union of tier accounts becomes the eligible set.
+- **`tiers`** — optional ordered fallback tiers for heterogeneous providers. Each tier is `{ "name": "…", "accounts": ["…"] }`. Dynamic ranking happens inside the first eligible tier; per-request failover exhausts peers in that tier before advancing to the next. This is the hard cost/model-quality boundary and is preferred over giving every account a unique priority.
 - **`bucket`** — optional: force which quota bucket governs eligibility (`unified7dFable`, `unified7dSonnet`, `unified7d`), for the rare case the family can't be inferred from the model id.
 - **`color`** — optional: `red`/`green`/`yellow`/`blue`/`magenta`/`cyan`, tinting this route's inline marker in the TUI (see below). Display only.
 

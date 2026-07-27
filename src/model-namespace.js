@@ -83,14 +83,22 @@ export const CLAUDE_CODE_GATE_MODELED_VERSION = '2.1.220';
  * callers can report WHICH route won — route order is load-bearing.
  */
 export function normalizeRoutes(routes) {
-  return (Array.isArray(routes) ? routes : []).map((r, i) => ({
-    index: i,
-    name: r?.name || `route-${i + 1}`,
-    match: (Array.isArray(r?.match) ? r.match : [r?.match]).filter(g => typeof g === 'string' && g),
-    accounts: Array.isArray(r?.accounts) ? r.accounts.map(String) : [],
-    bucket: r?.bucket || null,
-    color: r?.color || null,
-  })).filter(r => r.match.length)
+  return (Array.isArray(routes) ? routes : []).map((r, i) => {
+    const tiers = (Array.isArray(r?.tiers) ? r.tiers : []).map((t, j) => ({
+      name: t?.name || `tier-${j}`,
+      accounts: Array.isArray(t?.accounts) ? t.accounts.map(String) : [],
+    })).filter(t => t.accounts.length);
+    const tierAccounts = [...new Set(tiers.flatMap(t => t.accounts))];
+    return {
+      index: i,
+      name: r?.name || `route-${i + 1}`,
+      match: (Array.isArray(r?.match) ? r.match : [r?.match]).filter(g => typeof g === 'string' && g),
+      accounts: tiers.length ? tierAccounts : (Array.isArray(r?.accounts) ? r.accounts.map(String) : []),
+      tiers,
+      bucket: r?.bucket || null,
+      color: r?.color || null,
+    };
+  }).filter(r => r.match.length)
     .map((r, i) => ({ ...r, index: i })); // reindex after the drop, matching this.routes
 }
 
@@ -110,10 +118,13 @@ export function normalizeAccounts(accounts) {
     name: a?.name ?? `(account ${i})`,
     type: a?.type || (a?.apiKey ? 'apikey' : 'oauth'),
     priority: a?.priority || 0,
+    costTier: Number.isFinite(a?.costTier) ? a.costTier : 0,
     disabled: !!a?.disabled,
     upstream: a?.upstream || null,
     modelMap: a?.modelMap || null,
     models: Array.isArray(a?.models) && a.models.length ? a.models : null,
+    acceptsModels: Array.isArray(a?.acceptsModels) ? a.acceptsModels.map(String) : null,
+    strictModelMap: !!a?.strictModelMap,
   }));
 }
 
@@ -166,6 +177,20 @@ export function accountAllows(routes, accounts, account, model) {
     return route.accounts.includes(account.name) || route.accounts.includes(String(idx));
   }
   return accountOwnsModel(accounts, account, model);
+}
+
+/** Mirror AccountManager._acceptsModel: provider capability is independent of
+ * route eligibility. A strict closed adapter must translate every non-native
+ * id into its declared accepted set; an open/opaque adapter remains permissive. */
+export function accountAcceptsModel(account, model) {
+  if (!account || !model) return true;
+  const accepted = account.acceptsModels;
+  if (!accepted?.length && !account.strictModelMap) return true;
+  const mapped = account.modelMap && Object.prototype.hasOwnProperty.call(account.modelMap, model)
+    ? account.modelMap[model] : null;
+  if (mapped != null) return !accepted?.length || accepted.includes(String(mapped));
+  if (account.strictModelMap) return false;
+  return !accepted?.length || accepted.includes(String(model));
 }
 
 /** Every `blockedModels` glob that rejects `model`, in config order. The proxy
@@ -360,10 +385,11 @@ export function routabilityOf(config, model) {
   const glob = route ? (route.match.find(g => modelGlobMatches(g, model)) ?? route.match[0]) : null;
 
   const candidates = accounts
-    .filter(a => accountAllows(routes, accounts, a, model))
+    .filter(a => accountAllows(routes, accounts, a, model) && accountAcceptsModel(a, model))
     .map(a => ({
       name: a.name,
       priority: a.priority,
+      costTier: a.costTier,
       disabled: a.disabled,
       via: exclusive ? 'route' : 'ownership',
       mappedTo: a.modelMap && Object.prototype.hasOwnProperty.call(a.modelMap, model) ? a.modelMap[model] : null,
@@ -536,6 +562,13 @@ export function pinnedRoutabilityOf(config, model, pinToken) {
     && Object.prototype.hasOwnProperty.call(account.modelMap, model)
     ? account.modelMap[model]
     : null;
+  if (model && !accountAcceptsModel(account, model)) {
+    return {
+      ...base, account: view, mappedTo,
+      reason: `pinned account "${account.name}" is a closed adapter and cannot translate model "${model}" into its acceptsModels set. `
+        + 'The pin bypasses route selection, but it cannot make an unsupported provider model valid; forwarding would produce a known non-retryable 400.',
+    };
+  }
   const outsideRouting = !!model && !accountAllows(routes, accounts, account, model);
   const dest = account.upstream || 'the Anthropic API';
 

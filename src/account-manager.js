@@ -49,10 +49,24 @@ function makeAccount(acct, index) {
     orgUuid: acct.orgUuid || null,
     orgName: acct.orgName || null,
     priority: acct.priority || 0,
+    // Hard economic boundary. Dynamic ranking NEVER crosses to a higher-cost
+    // tier while a cheaper tier has an eligible account. This is deliberately
+    // separate from `priority`: priority is a deterministic fallback/tiebreak,
+    // not a disguised per-account tier that kills dynamic ranking whenever all
+    // values differ (the production config had seven distinct priorities, so
+    // its reset-time comparator was unreachable).
+    costTier: Number.isFinite(acct.costTier) ? acct.costTier : 0,
     disabled: acct.disabled || false,
     upstream: acct.upstream || null,
     modelMap: acct.modelMap || null,
     models: acct.models || null,
+    // Closed provider capability contract. Most Anthropic-compatible upstreams
+    // are open/opaque — absence means "do not guess". Adapters like DeepSeek
+    // expose a finite model set; for those, configure acceptsModels +
+    // strictModelMap so an untranslated id is excluded BEFORE selection rather
+    // than forwarded verbatim into a non-retryable 400.
+    acceptsModels: Array.isArray(acct.acceptsModels) ? acct.acceptsModels.map(String) : null,
+    strictModelMap: !!acct.strictModelMap,
     credential: acct.accessToken || acct.apiKey,
     refreshToken: acct.refreshToken || null,
     expiresAt: acct.expiresAt || null,
@@ -78,6 +92,15 @@ function makeAccount(acct, index) {
     // retry-after. Distinct from `throttled`/rateLimitedUntil: it does NOT
     // make the account unavailable, so selection never rotates away from it.
     pausedUntil: null,
+    // Passive provider health. Only custom upstream adapters participate: a
+    // transport failure or 502/503/504 is account-specific and should not keep
+    // winning selection while healthy siblings exist. The circuit is ephemeral
+    // by design — restarting the supervised adapter/data plane is a clean probe.
+    consecutiveFailures: 0,
+    circuitOpenUntil: null,
+    latencyEwmaMs: null,
+    lastFailure: null,
+    lastSuccessAt: null,
   };
 }
 
@@ -90,7 +113,15 @@ function modelMatches(declared, model) {
 }
 
 export class AccountManager {
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, throttleProbeFloorMs, routes, ramp, distributeSessions = false, sessionTracker } = {}) {
+  constructor(accounts, switchThreshold = 0.98, {
+    refreshFn = refreshAccessToken,
+    throttleProbeFloorMs,
+    routes,
+    ramp,
+    distributeSessions = false,
+    sessionTracker,
+    routingPolicy = {},
+  } = {}) {
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
     // OAuth token refresh.
     this._refreshFn = refreshFn;
@@ -103,6 +134,35 @@ export class AccountManager {
     // accounts by load instead of funnelling them all onto the current one.
     this.sessionTracker = sessionTracker || new SessionTracker();
     this.distributeSessions = !!distributeSessions;
+    // Selection policy:
+    //   priority-first (default) — v1.1.9 behavior, fully backward compatible.
+    //   shadow                   — serve with legacy order, compute/log dynamic
+    //                              disagreements for a no-impact rollout.
+    //   dynamic                  — costTier first, then use-or-lose quota order;
+    //                              priority is only a final deterministic tie.
+    const mode = ['priority-first', 'shadow', 'dynamic'].includes(routingPolicy?.mode)
+      ? routingPolicy.mode : 'priority-first';
+    this.routingPolicy = {
+      mode,
+      // Existing sessions stay pinned for cache locality unless their account is
+      // unavailable. Dynamic re-ranking is for new/unpinned sessions and
+      // failover, not a per-request cache-destroying shuffle.
+      preserveSessionAffinity: routingPolicy?.preserveSessionAffinity !== false,
+      // Headless/no-session callers have no cache identity to pin. Re-evaluate at
+      // a bounded cadence so reset rollovers are observed without changing the
+      // account on every request. Shadow uses the same cadence for meaningful A/B
+      // samples while still serving legacy decisions.
+      reevaluateMs: Number.isFinite(routingPolicy?.reevaluateMs)
+        ? Math.max(0, routingPolicy.reevaluateMs) : 5 * 60 * 1000,
+    };
+    // No-session callers still need model/route-local stickiness. One global
+    // currentIndex lets a Fable request reset the Opus reevaluation clock and
+    // makes unrelated families fight over one cache home. Session-tagged Claude
+    // traffic uses SessionTracker; these maps are the equivalent for headless,
+    // MCP and manual HTTP clients, keyed by the winning route (or family/id).
+    this._dynamicCurrentByKey = new Map();
+    this._dynamicEvalAtByKey = new Map();
+    this._shadowDecisions = { total: 0, changed: 0, last: null };
     // Ephemeral per-route manual pins (routeName → account index). Not persisted:
     // like the global manual switch (currentIndex) these are runtime overrides that
     // bias selection for a route's models and reset on restart. A pinned account
@@ -226,12 +286,14 @@ export class AccountManager {
     // session reset made a sooner-expiring account the better choice. This runs
     // on every request so the behaviour holds without the TUI render loop.
     this.refreshExpiredQuotas();
-    // Session-affinity distribution (opt-in): keep a session on its pinned
-    // account for cache reuse, and route a new session to the least-loaded
-    // account. Only when enabled, only for a real session, and only outside a
-    // manual route pin (which must still win). Falls through to the normal walk
-    // if nothing session-eligible is found (e.g. the whole tier is exhausted).
-    if (this.distributeSessions && sessionId && !this._pinnedAccountForModel(model, advisorModel)) {
+    // Dynamic routing needs a cache identity, not merely the old optional
+    // load-distribution flag. A known session remains on its home account; a NEW
+    // session is ranked dynamically. `distributeSessions` still adds active-load
+    // balancing to the final tie, but dynamic mode can use the existing tracker
+    // without requiring that separate feature to be enabled.
+    const sessionAware = !!sessionId && (this.distributeSessions
+      || (this.routingPolicy.mode === 'dynamic' && this.routingPolicy.preserveSessionAffinity));
+    if (sessionAware && !this._pinnedAccountForModel(model, advisorModel)) {
       const acc = this._selectForSession(sessionId, exclude, model, advisorModel);
       if (acc) return acc;
     }
@@ -247,6 +309,23 @@ export class AccountManager {
     return this._select(exclude, model, null, true);
   }
 
+  /** Stable key for no-session dynamic stickiness. Exact model ids are used on
+   * purpose: two ids matching one route can have different provider maps or
+   * model-scoped quota buckets, so route-name stickiness would cross-contaminate
+   * their decisions. Advisor model participates because the selected account
+   * must be jointly eligible for both. */
+  _dynamicKey(model, advisorModel = null) {
+    return `${model || '<default>'}|advisor:${advisorModel || '-'}`;
+  }
+
+  _rememberDynamic(key, account) {
+    if (!key || !account) return;
+    this._dynamicCurrentByKey.set(key, account.index);
+    // currentIndex remains the last-served global marker for TUI/backward status;
+    // it is no longer the routing authority for dynamic no-session traffic.
+    this.currentIndex = account.index;
+  }
+
   /** The selection walk getActiveAccount runs: manual pin → current account →
    * best-available. `allowProbe` gates the exhausted-fleet probe fallback so the
    * advisor-constrained pass can fail soft (degrade to executor-only) instead of
@@ -257,7 +336,9 @@ export class AccountManager {
     // through to normal best-available selection so requests keep flowing.
     const pinned = this._pinnedAccountForModel(model, advisorModel);
     if (pinned && this._isAvailable(pinned, model, advisorModel) && !exclude?.has(pinned.index)) return pinned;
-    const current = this.accounts[this.currentIndex];
+    const key = this._dynamicKey(model, advisorModel);
+    const dynamicIdx = this.routingPolicy.mode === 'dynamic' ? this._dynamicCurrentByKey.get(key) : null;
+    const current = this.accounts[dynamicIdx ?? this.currentIndex];
     // `model` scopes availability: an account whose Fable weekly bucket is spent
     // is still fully usable for other models, so it is only excluded when THIS
     // request targets Fable (see _isAvailable).
@@ -272,19 +353,51 @@ export class AccountManager {
       // when that pass comes up empty and selection degrades.
       if (allowProbe) current.requalify = false;
       const next = this._selectNext(exclude, model, advisorModel);
-      if (next) { current.requalify = false; return next; }
+      if (next) {
+        if (this.routingPolicy.mode === 'dynamic') this._rememberDynamic(key, next);
+        current.requalify = false;
+        return next;
+      }
+    }
+    // No session id means no prompt-cache identity exists to preserve. Revisit
+    // the dynamic rank at a bounded cadence so weekly/session reset rollovers are
+    // observed without thrashing on every request. Shadow computes the same
+    // decision and records disagreements but continues serving the legacy path.
+    const now = Date.now();
+    const lastEval = this._dynamicEvalAtByKey.get(key) || 0;
+    if (this.routingPolicy.mode !== 'priority-first'
+        && (this.routingPolicy.reevaluateMs === 0
+          || now - lastEval >= this.routingPolicy.reevaluateMs)) {
+      this._dynamicEvalAtByKey.set(key, now);
+      const candidate = this._pickBestAvailable(exclude, model, advisorModel);
+      if (this.routingPolicy.mode === 'dynamic' && candidate) {
+        const switched = candidate.index !== current?.index;
+        this._rememberDynamic(key, candidate);
+        if (switched) {
+          this._beginRamp(candidate);
+          console.log(`[TeamClaude] Dynamic re-rank: switched to "${candidate.name}" for model "${model || '<default>'}"`);
+        }
+        return candidate;
+      }
     }
     if (this._isAvailable(current, model, advisorModel) && !exclude?.has(current.index)) {
-      // A strictly higher-priority (lower value) available account preempts a
-      // healthy current one. Within the same priority tier we stay put, so the
-      // common case (all accounts at the default priority 0) is unchanged and
-      // never thrashes — preemption only triggers when priorities differ.
-      const betterExists = this.accounts.some(a =>
-        this._isAvailable(a, model, advisorModel) && !exclude?.has(a.index) && (a.priority || 0) < (current.priority || 0));
-      return betterExists ? this._selectNext(exclude, model, advisorModel) : current;
+      // Legacy/shadow preserve the existing static-priority preemption. Dynamic
+      // mode deliberately does NOT run this between re-evaluation points: doing
+      // so switches to the expiration-first winner, then the very next request
+      // bounces straight back to the lower numeric priority — a two-policy
+      // oscillation that destroys cache locality and makes dynamic mode a lie.
+      if (this.routingPolicy.mode !== 'dynamic') {
+        const betterExists = this.accounts.some(a =>
+          this._isAvailable(a, model, advisorModel) && !exclude?.has(a.index) && (a.priority || 0) < (current.priority || 0));
+        if (betterExists) return this._selectNext(exclude, model, advisorModel);
+      }
+      return current;
     }
     const next = this._selectNext(exclude, model, advisorModel);
-    if (next) return next;
+    if (next) {
+      if (this.routingPolicy.mode === 'dynamic') this._rememberDynamic(key, next);
+      return next;
+    }
     // No account is under the switch threshold. Before refusing locally, allow a
     // throttled probe so a stale/poisoned cached quota can't pin us in a
     // permanent "all exhausted" state — the probe's real response refreshes the
@@ -304,8 +417,11 @@ export class AccountManager {
     if (pinIdx != null) {
       const pinned = this.accounts[pinIdx];
       if (pinned && this._isAvailable(pinned, model, advisorModel) && !exclude?.has(pinIdx)) {
-        // Mirror _select's priority preemption so an operator's priority order
-        // still wins over a session's stickiness.
+        // Dynamic/shadow mode preserves a healthy session home. Reset-time
+        // optimization applies when assigning new work, not by moving a live
+        // prompt cache every time another account's rank changes. Legacy mode
+        // keeps its historical priority preemption semantics.
+        if (this.routingPolicy.mode !== 'priority-first') return pinned;
         const betterExists = this.accounts.some(a =>
           this._isAvailable(a, model, advisorModel) && !exclude?.has(a.index) && (a.priority || 0) < (pinned.priority || 0));
         if (!betterExists) return pinned;
@@ -314,36 +430,46 @@ export class AccountManager {
     return this._pickLeastLoaded(exclude, model, advisorModel);
   }
 
-  /** Best-available biased toward the fewest active sessions, so new sessions
-   * spread across equal-priority accounts instead of funnelling onto one. Order:
-   * priority → fewest active sessions → fewest in-flight → soonest weekly reset
-   * (the existing tiebreak). */
+  /** Best-available for a new session. The selected policy owns the primary
+   * order; active sessions and in-flight work resolve a full policy tie, then
+   * config order makes the result deterministic. In legacy mode this preserves
+   * priority → load → weekly-reset behavior. */
   _pickLeastLoaded(exclude = null, model = null, advisorModel = null) {
     const now = Date.now();
-    let best = null;
-    let bestPriority = Infinity;
-    let bestSessions = Infinity;
-    let bestInFlight = Infinity;
-    let bestReset = Infinity;
-    for (const account of this.accounts) {
-      if (exclude?.has(account.index)) continue;
-      if (!this._isAvailable(account, model, advisorModel)) continue;
-      const priority = account.priority || 0;
-      const sessions = this.sessionTracker.activeCountFor(account.index, now);
-      const inFlight = account.inFlight || 0;
-      const reset = this._governingWeeklyReset(account, model) || -Infinity;
-      if (priority < bestPriority
-        || (priority === bestPriority && sessions < bestSessions)
-        || (priority === bestPriority && sessions === bestSessions && inFlight < bestInFlight)
-        || (priority === bestPriority && sessions === bestSessions && inFlight === bestInFlight && reset < bestReset)) {
-        best = account;
-        bestPriority = priority;
-        bestSessions = sessions;
-        bestInFlight = inFlight;
-        bestReset = reset;
-      }
+    const eligible = this.accounts.filter(a =>
+      !exclude?.has(a.index) && this._isAvailable(a, model, advisorModel));
+    const compareLoad = (a, b) => {
+      const sessions = this.sessionTracker.activeCountFor(a.index, now)
+        - this.sessionTracker.activeCountFor(b.index, now);
+      if (sessions) return sessions;
+      const inFlight = (a.inFlight || 0) - (b.inFlight || 0);
+      if (inFlight) return inFlight;
+      return a.index - b.index;
+    };
+    if (this.routingPolicy.mode === 'priority-first') {
+      return [...eligible].sort((a, b) => {
+        const pa = a.priority || 0;
+        const pb = b.priority || 0;
+        if (pa !== pb) return pa - pb;
+        const load = compareLoad(a, b);
+        if (load) return load;
+        return (this._governingWeeklyReset(a, model) || -Infinity)
+          - (this._governingWeeklyReset(b, model) || -Infinity);
+      })[0] || null;
     }
-    return best;
+    const legacy = [...eligible].sort((a, b) => {
+      const c = this._legacyCompare(a, b, model);
+      return c || compareLoad(a, b);
+    })[0] || null;
+    const dynamic = [...eligible].sort((a, b) => {
+      const c = this.dynamicCompare(a, b, model, now);
+      return c || compareLoad(a, b);
+    })[0] || null;
+    if (this.routingPolicy.mode === 'shadow') {
+      this._recordShadowDecision(legacy, dynamic, model);
+      return legacy;
+    }
+    return dynamic;
   }
 
   /** Record that a session's request was served by an account (always on, even
@@ -492,6 +618,7 @@ export class AccountManager {
     if (now < this._nextProbeAt) return null;
 
     let best = null;
+    let bestTier = Infinity;
     let bestPriority = Infinity;
     let bestUsage = Infinity;
     for (const account of this.accounts) {
@@ -504,10 +631,16 @@ export class AccountManager {
       // Same for routing/ownership: a probe for a routed or owned model must not
       // land on an ineligible account (it would just reject the unknown model id).
       if (model && !this._routeAllows(account, model)) continue;
+      if (model && !this._acceptsModel(account, model)) continue;
+      // The probe is a last-resort attempt after normal availability failed, but
+      // cost/quality tiers still govern which uncertainty we pay to resolve.
+      const tier = this._costTierFor(account, model);
       const priority = account.priority || 0;
       const usage = this._maxUtilization(account, model);
-      if (priority < bestPriority ||
-          (priority === bestPriority && usage < bestUsage)) {
+      if (tier < bestTier
+          || (tier === bestTier && priority < bestPriority)
+          || (tier === bestTier && priority === bestPriority && usage < bestUsage)) {
+        bestTier = tier;
         bestPriority = priority;
         bestUsage = usage;
         best = account;
@@ -542,6 +675,15 @@ export class AccountManager {
     }
 
     if (account.status === 'exhausted' || account.status === 'error') return false;
+    // Custom-adapter circuit breaker. A real Anthropic OAuth account has no
+    // local adapter boundary, so transport errors there keep the established
+    // client-retry semantics rather than being mistaken for account health.
+    if (account.upstream && account.circuitOpenUntil) {
+      if (Date.now() < account.circuitOpenUntil) return false;
+      // Half-open: let one real request test it. Selection/ramp prevents a herd;
+      // success closes, failure reopens with exponential backoff.
+      account.circuitOpenUntil = null;
+    }
     // Model-scoped: _isNearQuota checks the shared 5h bucket plus only the weekly
     // bucket that governs this model, so a spent Fable/Sonnet bucket bars just
     // that family — the account still serves every other model normally.
@@ -552,6 +694,14 @@ export class AccountManager {
     // restricts an owned model to its owners. Either way an account not eligible
     // for this model is skipped so the request never lands somewhere it can't run.
     if (model && !this._routeAllows(account, model)) return false;
+    // Provider capability is a SECOND, independent gate. Routes answer "may this
+    // account be considered?"; this answers "can its adapter actually translate
+    // this exact wire id?" Today these can disagree: a fugu route legitimately
+    // listed DeepSeek, but DeepSeek accepts only two model names and received
+    // `claude-fugu-ultra` verbatim, returning a non-retryable 400 that stopped the
+    // entire fallback chain. Closed adapters opt into strictModelMap; open/opaque
+    // adapters remain permissive because teamclaude cannot see their native map.
+    if (model && !this._acceptsModel(account, model)) return false;
 
     // An advisor request additionally needs the account to serve the ADVISOR's
     // model: its family bucket must have headroom (the shared buckets were
@@ -560,9 +710,30 @@ export class AccountManager {
     if (advisorModel) {
       if (this._modelWeeklyExhausted(account, advisorModel)) return false;
       if (!this._routeAllows(account, advisorModel)) return false;
+      if (!this._acceptsModel(account, advisorModel)) return false;
     }
 
     return true;
+  }
+
+  /** Whether a closed adapter can turn `model` into a model its upstream knows.
+   *
+   * Open/opaque adapters have no acceptsModels list and remain permissive. For a
+   * closed adapter, modelMap wins; a passthrough id is valid only if it is in the
+   * declared accepted set. strictModelMap tightens the contract further: every
+   * non-native id must be translated. This is intentionally in eligibility, not
+   * rewriteModel(), because discovering incompatibility after account selection
+   * produces a 400 response — and teamclaude's correct policy is to never fail
+   * over on an arbitrary 400. Prevention is the only honest retry strategy. */
+  _acceptsModel(account, model) {
+    if (!account || !model) return true;
+    const accepted = account.acceptsModels;
+    if (!accepted?.length && !account.strictModelMap) return true;
+    const mapped = account.modelMap && Object.prototype.hasOwnProperty.call(account.modelMap, model)
+      ? account.modelMap[model] : null;
+    if (mapped != null) return !accepted?.length || accepted.includes(String(mapped));
+    if (account.strictModelMap) return false;
+    return !accepted?.length || accepted.includes(String(model));
   }
 
   /**
@@ -572,13 +743,24 @@ export class AccountManager {
    *   { name, match: string|string[], accounts?: (name|index)[], bucket? }
    */
   setRoutes(routes) {
-    this.routes = (Array.isArray(routes) ? routes : []).map((r, i) => ({
-      name: r.name || `route-${i + 1}`,
-      match: (Array.isArray(r.match) ? r.match : [r.match]).filter(g => typeof g === 'string' && g),
-      accounts: Array.isArray(r.accounts) ? r.accounts.map(String) : [],
-      bucket: r.bucket || null,
-      color: r.color || null, // display-only accent for the route's inline marker
-    })).filter(r => r.match.length);
+    this.routes = (Array.isArray(routes) ? routes : []).map((r, i) => {
+      const tiers = (Array.isArray(r.tiers) ? r.tiers : []).map((t, j) => ({
+        name: t?.name || `tier-${j}`,
+        accounts: Array.isArray(t?.accounts) ? t.accounts.map(String) : [],
+      })).filter(t => t.accounts.length);
+      // A tiered route's eligible set is the union of all tiers. `accounts` is
+      // retained for backward compatibility and for untiered routes; when tiers
+      // exist they are the authoritative eligibility + fallback structure.
+      const tierAccounts = [...new Set(tiers.flatMap(t => t.accounts))];
+      return {
+        name: r.name || `route-${i + 1}`,
+        match: (Array.isArray(r.match) ? r.match : [r.match]).filter(g => typeof g === 'string' && g),
+        accounts: tiers.length ? tierAccounts : (Array.isArray(r.accounts) ? r.accounts.map(String) : []),
+        tiers,
+        bucket: r.bucket || null,
+        color: r.color || null,
+      };
+    }).filter(r => r.match.length);
     // Drop pins for routes that no longer exist after a reload.
     if (this.routePins?.size) {
       const names = new Set(this.routes.map(r => r.name));
@@ -869,44 +1051,127 @@ export class AccountManager {
     return false;
   }
 
+  /** Legacy v1.1.9 comparison: static priority dominates; unknown weekly reset
+   * sorts first so one request measures it. Kept as a named comparator both for
+   * backward compatibility and for shadow-mode A/B evidence. */
+  _legacyCompare(a, b, model) {
+    const pa = a.priority || 0;
+    const pb = b.priority || 0;
+    if (pa !== pb) return pa - pb;
+    const ra = this._governingWeeklyReset(a, model) || -Infinity;
+    const rb = this._governingWeeklyReset(b, model) || -Infinity;
+    if (ra !== rb) return ra - rb;
+    return 0;
+  }
+
+  /** A complete weekly window, or Infinity when it cannot support an
+   * expiration-first claim. Reset-without-utilization is not evidence: a stale
+   * partial probe must not outrank an account whose state is honestly unknown.
+   * Family-specific quota wins, then the shared weekly fallback. */
+  _completeWeeklyReset(account, model, now = Date.now()) {
+    const q = account.quota;
+    const key = this._weeklyBucketFor(model);
+    const specificReset = q[`${key}Reset`];
+    if (q[key] != null && specificReset && specificReset > now) return specificReset;
+    if (q.unified7d != null && q.unified7dReset && q.unified7dReset > now) return q.unified7dReset;
+    return Infinity;
+  }
+
+  /** Complete session/reset signal. Unified 5h is preferred; standard token or
+   * request quotas can use `resetsAt` only when a corresponding limit pair is
+   * complete. Unknown ranks at Infinity, never as "0% used". */
+  _completeSessionReset(account, now = Date.now()) {
+    const q = account.quota;
+    if (q.unified5h != null && q.unified5hReset && q.unified5hReset > now) return q.unified5hReset;
+    const standardComplete = (q.tokensLimit != null && q.tokensRemaining != null)
+      || (q.requestsLimit != null && q.requestsRemaining != null);
+    if (!standardComplete || !q.resetsAt) return Infinity;
+    const t = typeof q.resetsAt === 'number' ? q.resetsAt : new Date(q.resetsAt).getTime();
+    return Number.isFinite(t) && t > now ? t : Infinity;
+  }
+
+  /** Utilization used only after reset timing ties. Lower first: with the same
+   * expiry, drain the account with more capacity remaining. Unknown is Infinity
+   * so an opaque paid backend cannot masquerade as pristine quota. */
+  _dynamicUtilization(account, model) {
+    const q = account.quota;
+    const vals = [];
+    const weekly = this._governingWeekly(account, model);
+    if (weekly != null) vals.push(weekly);
+    if (q.unified5h != null) vals.push(q.unified5h);
+    if (q.tokensLimit != null && q.tokensRemaining != null && q.tokensLimit > 0) {
+      vals.push(1 - q.tokensRemaining / q.tokensLimit);
+    }
+    if (q.requestsLimit != null && q.requestsRemaining != null && q.requestsLimit > 0) {
+      vals.push(1 - q.requestsRemaining / q.requestsLimit);
+    }
+    return vals.length ? Math.max(...vals) : Infinity;
+  }
+
+  /** The cost/fallback tier for this account on THIS model's route. Route tiers
+   * are authoritative; account.costTier is the backward-compatible fallback.
+   * Numeric account tokens resolve the same way route eligibility does. */
+  _costTierFor(account, model) {
+    const route = this._routeForModel(model);
+    if (route?.tiers?.length) {
+      const token = String(account.index);
+      const i = route.tiers.findIndex(t => t.accounts.includes(account.name) || t.accounts.includes(token));
+      return i >= 0 ? i : Infinity;
+    }
+    return account.costTier;
+  }
+
+  /** Dynamic order: hard economic/quality tier for THIS route, then use-or-lose
+   * reset windows, then remaining capacity, with static priority only as a
+   * deterministic final tie. */
+  dynamicCompare(a, b, model, now = Date.now()) {
+    const ta = this._costTierFor(a, model);
+    const tb = this._costTierFor(b, model);
+    if (ta !== tb) return ta - tb;
+    const wa = this._completeWeeklyReset(a, model, now);
+    const wb = this._completeWeeklyReset(b, model, now);
+    if (wa !== wb) return wa - wb;
+    const sa = this._completeSessionReset(a, now);
+    const sb = this._completeSessionReset(b, now);
+    if (sa !== sb) return sa - sb;
+    const ua = this._dynamicUtilization(a, model);
+    const ub = this._dynamicUtilization(b, model);
+    if (ua !== ub) return ua - ub;
+    const pa = a.priority || 0;
+    const pb = b.priority || 0;
+    if (pa !== pb) return pa - pb;
+    return 0;
+  }
+
+  _recordShadowDecision(legacy, dynamic, model) {
+    this._shadowDecisions.total += 1;
+    if (!legacy || !dynamic || legacy.index === dynamic.index) return;
+    this._shadowDecisions.changed += 1;
+    const signature = `${model || '<default>'}:${legacy.name}->${dynamic.name}`;
+    if (this._shadowDecisions.last !== signature) {
+      this._shadowDecisions.last = signature;
+      console.log(`[TeamClaude] SHADOW routing model="${model || '<default>'}": legacy="${legacy.name}" dynamic="${dynamic.name}"`);
+    }
+  }
+
   /**
-   * Pick the best available account by selection order, WITHOUT mutating state:
-   *   1. lowest `priority` value (operator-controlled; default 0, lower = preferred)
-   *   2. then the account with no known weekly limit — using it lets us
-   *      discover its quota
-   *   3. then the account whose weekly limit expires soonest: that quota is
-   *      closest to refreshing, so spending it first preserves accounts whose
-   *      weekly window resets further out.
-   * With all priorities at the default 0, this reduces to the weekly-reset
-   * heuristic. Returns the account or null if none are available.
+   * Pick the best available account by the configured policy, WITHOUT mutating
+   * state. `priority-first` is byte-for-byte the old semantic order; `shadow`
+   * serves legacy and records disagreement; `dynamic` serves expiration-first.
    */
   _pickBestAvailable(exclude = null, model = null, advisorModel = null) {
-    let best = null;
-    let bestPriority = Infinity;
-    let bestReset = Infinity;
+    const eligible = this.accounts.filter(account =>
+      !exclude?.has(account.index) && this._isAvailable(account, model, advisorModel));
+    if (!eligible.length) return null;
 
-    for (let i = 0; i < this.accounts.length; i++) {
-      const account = this.accounts[i];
-      if (exclude?.has(account.index)) continue;
-      // _isAvailable filters out accounts at/above the switch threshold, so the
-      // soonest-expiring pick only ever lands on an account whose 5-hour quota
-      // is still below 98%.
-      if (!this._isAvailable(account, model, advisorModel)) continue;
-
-      const priority = account.priority || 0;
-      // Rank by the reset of the weekly bucket that governs THIS model (Fable and
-      // Sonnet have their own), so a Fable request spends the account whose Fable
-      // window refreshes soonest while preserving accounts that reset later for
-      // Opus/Sonnet. Unknown reset sorts first so we probe and fill it in.
-      const weeklyReset = this._governingWeeklyReset(account, model) || -Infinity;
-      if (priority < bestPriority ||
-          (priority === bestPriority && weeklyReset < bestReset)) {
-        bestPriority = priority;
-        bestReset = weeklyReset;
-        best = account;
-      }
+    const legacy = [...eligible].sort((a, b) => this._legacyCompare(a, b, model))[0];
+    if (this.routingPolicy.mode === 'priority-first') return legacy;
+    const dynamic = [...eligible].sort((a, b) => this.dynamicCompare(a, b, model))[0];
+    if (this.routingPolicy.mode === 'shadow') {
+      this._recordShadowDecision(legacy, dynamic, model);
+      return legacy;
     }
-    return best;
+    return dynamic;
   }
 
   /**
@@ -1049,6 +1314,31 @@ export class AccountManager {
           : '?';
       console.log(`[TeamClaude] Account "${account.name}" at ${pct}% usage — will switch on next request`);
     }
+  }
+
+  /** Record custom-adapter health from one completed attempt. Returns the open
+   * duration on failure, or 0 on success. Bounded exponential backoff keeps a
+   * dead adapter out of selection without turning a brief blip into a long
+   * outage: 2s, 4s, ... max 60s. */
+  noteProviderResult(accountIndex, { ok, latencyMs = null, status = null, error = null } = {}) {
+    const a = this.accounts[accountIndex];
+    if (!a || !a.upstream) return 0;
+    if (Number.isFinite(latencyMs) && latencyMs >= 0) {
+      a.latencyEwmaMs = a.latencyEwmaMs == null ? latencyMs : (0.8 * a.latencyEwmaMs + 0.2 * latencyMs);
+    }
+    if (ok) {
+      a.consecutiveFailures = 0;
+      a.circuitOpenUntil = null;
+      a.lastFailure = null;
+      a.lastSuccessAt = Date.now();
+      return 0;
+    }
+    a.consecutiveFailures += 1;
+    const openMs = Math.min(60_000, 1000 * 2 ** Math.min(a.consecutiveFailures, 6));
+    a.circuitOpenUntil = Date.now() + openMs;
+    a.lastFailure = { at: Date.now(), status: status || null, error: error ? String(error).slice(0, 240) : null };
+    console.log(`[TeamClaude] Circuit open for custom account "${a.name}" ${openMs}ms after failure #${a.consecutiveFailures}`);
+    return openMs;
   }
 
   /**
@@ -1211,6 +1501,45 @@ export class AccountManager {
     });
   }
 
+  /** Update the non-credential policy fields of an existing account during a
+   * config reload. These fields are consumed directly by selection/rewrite and
+   * were previously snapshotted forever at startup — pressing Reload said
+   * "Config reloaded" while a changed modelMap still did nothing. Returns the
+   * names of fields that changed for an auditable reload acknowledgment. */
+  updateAccountPolicy(index, disk) {
+    const a = this.accounts[index];
+    if (!a || !disk) return [];
+    const changed = [];
+    const set = (field, value) => {
+      const before = JSON.stringify(a[field]);
+      const after = JSON.stringify(value);
+      if (before === after) return;
+      a[field] = value;
+      changed.push(field);
+    };
+    set('priority', disk.priority || 0);
+    set('costTier', Number.isFinite(disk.costTier) ? disk.costTier : 0);
+    set('upstream', disk.upstream || null);
+    set('modelMap', disk.modelMap || null);
+    set('models', disk.models || null);
+    set('acceptsModels', Array.isArray(disk.acceptsModels) ? disk.acceptsModels.map(String) : null);
+    set('strictModelMap', !!disk.strictModelMap);
+    return changed;
+  }
+
+  /** Update the runtime selection policy from disk. */
+  setRoutingPolicy(policy = {}) {
+    const mode = ['priority-first', 'shadow', 'dynamic'].includes(policy?.mode)
+      ? policy.mode : 'priority-first';
+    this.routingPolicy = {
+      mode,
+      preserveSessionAffinity: policy?.preserveSessionAffinity !== false,
+      reevaluateMs: Number.isFinite(policy?.reevaluateMs)
+        ? Math.max(0, policy.reevaluateMs) : 5 * 60 * 1000,
+    };
+    return this.routingPolicy;
+  }
+
   /**
    * Add a new account at runtime.
    */
@@ -1278,6 +1607,8 @@ export class AccountManager {
     return {
       currentAccount: this.accounts[this.currentIndex]?.name,
       switchThreshold: this.switchThreshold,
+      routingPolicy: { ...this.routingPolicy },
+      shadowDecisions: { ...this._shadowDecisions },
       routes: this.getRoutes(),
       sessions: { ...sessions, distribute: this.distributeSessions },
       accounts: this.accounts.map(a => ({
@@ -1285,8 +1616,13 @@ export class AccountManager {
         type: a.type,
         orgName: a.orgName || null,
         priority: a.priority || 0,
+        costTier: a.costTier,
         disabled: a.disabled || false,
         status: a.status,
+        capability: {
+          strictModelMap: a.strictModelMap,
+          acceptsModels: a.acceptsModels ? [...a.acceptsModels] : null,
+        },
         sessions: sessions.perAccount[a.index] || 0,
         quota: { ...a.quota },
         usage: { ...a.usage },
@@ -1296,6 +1632,14 @@ export class AccountManager {
         pausedUntil: a.pausedUntil && a.pausedUntil > Date.now()
           ? new Date(a.pausedUntil).toISOString()
           : null,
+        health: {
+          consecutiveFailures: a.consecutiveFailures,
+          circuitOpenUntil: a.circuitOpenUntil && a.circuitOpenUntil > Date.now()
+            ? new Date(a.circuitOpenUntil).toISOString() : null,
+          latencyEwmaMs: a.latencyEwmaMs,
+          lastFailure: a.lastFailure,
+          lastSuccessAt: a.lastSuccessAt ? new Date(a.lastSuccessAt).toISOString() : null,
+        },
       })),
     };
   }

@@ -47,6 +47,7 @@ import {
   modelMatches,
   routeForModel,
   accountAllows,
+  accountAcceptsModel,
   blockedByAll,
   routabilityOf,
   pinnedRoutabilityOf,
@@ -105,7 +106,12 @@ function eligibilityFor(account, { model, routes, accounts, winner, owners }) {
     return { eligible: false, reason: 'disabled', detail: 'disabled by the operator (teamclaude enable to restore)' };
   }
   if (!model) return { eligible: true, reason: 'no model id — route/ownership rules are not consulted' };
-  const eligible = accountAllows(routes, accounts, account, model);
+  const routeEligible = accountAllows(routes, accounts, account, model);
+  const capable = accountAcceptsModel(account, model);
+  const eligible = routeEligible && capable;
+  if (routeEligible && !capable) {
+    return { eligible: false, reason: 'provider-capability', detail: 'route allows it, but the closed adapter cannot translate this model id' };
+  }
   if (winner && winner.route.accounts.length) {
     return eligible
       ? { eligible: true, reason: `listed in route "${winner.name}"` }
@@ -128,7 +134,17 @@ function eligibilityFor(account, { model, routes, accounts, winner, owners }) {
 // first. From config alone every reset is unknown, so (2) collapses to a tie and
 // the loop's strict `<` leaves the first account in array order ahead — the
 // order reproduced here. `notes` says so out loud.
-function orderCandidates(accounts, eligible) {
+function orderCandidates(accounts, eligible, config = {}) {
+  const allowed = accounts.filter(a => eligible.has(a.index));
+  const mode = config?.routingPolicy?.mode || 'priority-first';
+  if (mode === 'dynamic' || mode === 'shadow') {
+    // Config alone has no live reset/utilization/health state. Show the hard
+    // economic tiers, then priority only as the deterministic UNKNOWN-state
+    // fallback; the trace notes explicitly point to /teamclaude/status for the
+    // actual live order. Pretending this is the dynamic rank would recreate the
+    // exact static-priority lie this feature removes.
+    return [...allowed].sort((a, b) => a.costTier - b.costTier || a.priority - b.priority || a.index - b.index);
+  }
   const order = [];
   const tried = new Set();
   while (order.length < accounts.length) {
@@ -257,7 +273,7 @@ export function explainRouting(config, model, opts = {}) {
     };
   }
 
-  const ordered = orderCandidates(accounts, eligible);
+  const ordered = orderCandidates(accounts, eligible, config);
   const candidates = pin
     ? (pin.account ? [pin.account] : [])
     : ordered.map((a, i) => view(a, i + 1));
@@ -430,10 +446,15 @@ function buildWarnings({ routes, accounts, id, winner, owners, ownershipDecides,
 // Everything this trace deliberately cannot know. Stating them is the point:
 // a quota-blind explanation that pretends to be live is worse than none.
 function buildNotes({ cfg, candidates, id }) {
-  const notes = [
-    'order is quota-blind: priority ascending, then config array order. The router\'s real tiebreak inside a priority tier is the soonest governing weekly reset (unknown-first), which config alone cannot supply (account-manager.js:883-910).',
-    'a running server also stays on whichever account is already current within the same priority tier rather than thrashing, so the intra-tier order can differ from the one shown (account-manager.js:277-285).',
-    'not visible from config: live quota utilization vs switchThreshold, throttle holds, error/exhausted status, and ephemeral `teamclaude route pin` overrides — any of these can skip a candidate at request time.',
+  const mode = cfg?.routingPolicy?.mode || 'priority-first';
+  const notes = mode === 'priority-first' ? [
+    'order is quota-blind: priority ascending, then config array order. The live router may use a same-priority weekly-reset tiebreak that config alone cannot supply.',
+    'a running server also stays on its current account within a priority tier for cache locality, so the live intra-tier order can differ from the static order shown.',
+    'not visible from config: live quota utilization/reset, circuit state/latency, throttle holds, error/exhausted status, and ephemeral route pins — any can skip a candidate at request time.',
+  ] : [
+    `routingPolicy.mode is "${mode}": the table shows costTier then static priority ONLY as the unknown-state fallback. The live data plane ranks complete weekly reset → complete session reset → utilization inside the cheapest eligible tier.`,
+    'config-only explain cannot see the live quota/circuit/session state that decides dynamic order; read GET /teamclaude/status for routingPolicy, shadowDecisions, account quota and health.',
+    'known sessions remain pinned for prompt-cache locality; dynamic rank assigns new sessions and failover, rather than thrashing an existing session on every reset change.',
   ];
   if (cfg.distributeSessions) {
     notes.push('distributeSessions is ON: a request carrying x-claude-code-session-id is placed by session affinity / least-loaded selection instead of this walk (account-manager.js:234-237, :302-315).');

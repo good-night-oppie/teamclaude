@@ -39,7 +39,7 @@ test('a coherent config produces no problems, only notes, and exits 0', () => {
   };
   const findings = checkConfig(config);
   assert.ok(findings.every(f => f.severity === 'info'), 'nothing here is broken');
-  assert.deepEqual(codes(findings).sort(), ['catchall-shadows-ownership', 'no-client-allowlist']);
+  assert.deepEqual(codes(findings).sort(), ['catchall-shadows-ownership', 'dynamic-ranking-inert', 'no-client-allowlist']);
   assert.equal(doctorExitCode(findings), 0, 'info-only never fails a cron job');
   assert.match(formatFindings(findings).join('\n'), /No problems found/);
 });
@@ -385,4 +385,58 @@ test('findings are ordered most severe first and render with their remedies', ()
   assert.match(out, /→ /, 'every finding carries a next step');
   assert.match(out, /exit 3/);
   assert.ok(!out.includes('\u001b'), 'plain text, no ANSI — the output is meant to be pasted');
+});
+
+// ── provider capability and dynamic activation ─────────────────────────────
+
+test('doctor catches the live outage shape: route permits closed adapter but modelMap cannot translate', () => {
+  const config = {
+    accounts: [
+      apikey('sakana', { upstream: 'http://127.0.0.1:8083' }),
+      apikey('deepseek', {
+        upstream: 'http://127.0.0.1:8085',
+        acceptsModels: ['deepseek-v4-flash', 'deepseek-v4-pro'],
+        strictModelMap: true,
+        modelMap: { 'claude-sonnet-5': 'deepseek-v4-flash' },
+      }),
+    ],
+    routes: [{ name: 'fugu', match: ['*fugu*'], accounts: ['sakana', 'deepseek'] }],
+  };
+  const findings = checkConfig(config, { availableModels: ['claude-fugu-ultra', 'claude-fugu'] });
+  const f = find(findings, 'route-capability-hole');
+  assert.ok(f);
+  assert.equal(f.severity, 'error');
+  assert.match(f.message, /claude-fugu-ultra/);
+  assert.match(f.message, /non-retryable provider 400/);
+});
+
+test('doctor considers a closed adapter coherent when every routed concrete id maps to an accepted target', () => {
+  const config = {
+    routingPolicy: { mode: 'dynamic' },
+    accounts: [apikey('deepseek', {
+      costTier: 10,
+      upstream: 'http://127.0.0.1:8085',
+      acceptsModels: ['deepseek-v4-flash', 'deepseek-v4-pro'],
+      strictModelMap: true,
+      modelMap: {
+        'claude-fugu-ultra': 'deepseek-v4-pro',
+        'claude-fugu': 'deepseek-v4-flash',
+      },
+    })],
+    routes: [{ name: 'fugu', match: ['*fugu*'], accounts: ['deepseek'] }],
+  };
+  const findings = checkConfig(config, { availableModels: ['claude-fugu-ultra', 'claude-fugu'] });
+  assert.equal(find(findings, 'route-capability-hole'), undefined);
+});
+
+test('doctor warns when every dynamic cost tier is a singleton', () => {
+  const config = {
+    routingPolicy: { mode: 'dynamic' },
+    accounts: [oauth('a', { costTier: 0 }), oauth('b', { costTier: 1 })],
+    routes: [],
+  };
+  const f = find(checkConfig(config), 'dynamic-singleton-tiers');
+  assert.ok(f);
+  assert.equal(f.severity, 'warn');
+  assert.match(f.message, /degenerates to static tier order/);
 });
