@@ -18,6 +18,7 @@ import { TUI } from './tui.js';
 import { SxManager } from './sx.js';
 import { autoUpdate, checkForUpdate, currentVersion, runUpdate, installKind, PKG_NAME } from './updater.js';
 import { renderStatus } from './status-renderer.js';
+import { syncAccountsFromDisk } from './config-reload.js';
 import { buildClaudeEnvLines, encodePinComponent, directLaunchEnvPlan } from './claude-env.js';
 import { deriveNamespace } from './model-namespace.js';
 import { explainRouting, formatExplain, launchSummary } from './route-explain.js';
@@ -27,6 +28,7 @@ import {
 } from './model-preflight.js';
 import { readAvailableModels } from './claude-settings.js';
 import { checkConfig, formatFindings, doctorExitCode } from './config-doctor.js';
+import { replayRank, formatRankReplay } from './rank-replay.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
 
 const args = process.argv.slice(2);
@@ -138,6 +140,10 @@ switch (command) {
   case 'doctor':
     await doctorCommand();
     break;
+  case 'rank':
+    await rankCommand();
+    process.exit(0);
+    break;
   case 'update':
     await updateCommand();
     process.exit(0);
@@ -205,7 +211,12 @@ async function serverCommand() {
   }
 
   const threshold = config.switchThreshold || 0.98;
-  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions });
+  const accountManager = new AccountManager(accounts, threshold, {
+    routes: config.routes,
+    ramp: config.stormRamp,
+    distributeSessions: config.distributeSessions,
+    routingPolicy: config.routingPolicy,
+  });
 
   // Restore quota observed in a previous run so a restart doesn't lose rotation
   // state (passive — we never call the API to re-learn it). Stale windows are
@@ -288,10 +299,12 @@ async function serverCommand() {
   const reloadAccounts = async () => {
     const diskConfig = await loadConfig();
     if (!diskConfig) return 0;
-    const added = await syncAccountsFromDisk(diskConfig, config, accountManager);
-    // Pick up route table edits (teamclaude route …, TUI editor, or a hand edit).
+    const added = await syncAccountsFromDisk(diskConfig, config, accountManager, { importCredentials });
+    // Pick up route table + routing-policy edits atomically with account policy.
     config.routes = diskConfig.routes || [];
+    config.routingPolicy = diskConfig.routingPolicy || { mode: 'priority-first' };
     accountManager.setRoutes(config.routes);
+    accountManager.setRoutingPolicy(config.routingPolicy);
     // Apply an sx.org key/mode change made on disk (e.g. via POST /teamclaude/reload).
     const diskSxKey = diskConfig.sx?.apiKey || null;
     const diskSxMode = diskConfig.sx?.mode || 'always';
@@ -1102,6 +1115,32 @@ async function doctorCommand() {
   process.exit(code);
 }
 
+// `teamclaude rank <model>` — offline evidence for a shadow→dynamic promotion
+// decision. Loads config + the persisted quota snapshot (config.js state file,
+// the same one restored on server start) and computes what legacy AND dynamic
+// mode would choose right now, without making any request or mutating state.
+// This is the safe way to validate dynamic ranking: it replays real, already-
+// collected quota evidence rather than sending duplicate authenticated OAuth
+// traffic through a second process, which can trip the same per-minute
+// rate-limit a live session is using.
+async function rankCommand() {
+  const model = args[1];
+  const json = args.includes('--json');
+  if (!model || model.startsWith('--')) {
+    console.error('Usage: teamclaude rank <model> [--json]');
+    process.exit(1);
+  }
+  const config = await loadConfig();
+  if (!config) {
+    console.error(`No config found at ${getConfigPath()}. Add an account first: teamclaude login`);
+    process.exit(1);
+  }
+  const saved = await loadState().catch(() => null);
+  const result = replayRank(config, saved?.quota || null, model);
+  if (json) { console.log(JSON.stringify(result, null, 2)); return; }
+  console.log(formatRankReplay(result));
+}
+
 // A single settings file named explicitly, for checking a config that is not
 // this host's. Same contract as readAvailableModels: availableModels only.
 function readAvailableModelsFromFile(path) {
@@ -1675,6 +1714,9 @@ Commands:
   doctor [--json]     Check routes, modelMap keys, models[] claims and Claude
                       Code's availableModels for dead or conflicting config
                       (--strict, --claude-settings <file>; exit codes below)
+  rank <model>        Offline legacy-vs-dynamic routing decision, replayed from
+                      the persisted quota snapshot (no request, no mutation;
+                      --json). Evidence for a shadow -> dynamic promotion.
   probe [off|secs]    Opt-in background quota refresh for idle accounts
                       (off by default; reads usage endpoint, spends no quota)
   warmup [off|secs]   Opt-in: keep idle accounts' 5h timers running by sending
@@ -1845,84 +1887,6 @@ function findConfigAccount(diskConfig, account) {
  * for existing ones (handles re-imported OAuth tokens, rotated API keys, etc.).
  * Returns the number of new accounts added.
  */
-async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
-  let added = 0;
-  // Greedy 1:1 pairing of disk entries to in-memory accounts, account+org aware.
-  // Each disk entry claims at most one unclaimed manager account, so multiple
-  // same-person/different-org entries pair correctly instead of all matching the
-  // first one with that accountUuid.
-  const claimed = new Set();
-  const claim = (diskAcct) => {
-    for (let i = 0; i < accountManager.accounts.length; i++) {
-      if (!claimed.has(i) && sameIdentity(accountManager.accounts[i], diskAcct)) {
-        claimed.add(i);
-        return i;
-      }
-    }
-    return -1;
-  };
-
-  for (const diskAcct of diskConfig.accounts) {
-    const mgrIdx = claim(diskAcct);
-
-    if (mgrIdx < 0) {
-      // New account discovered on disk — add to running server
-      memConfig.accounts.push(diskAcct);
-      accountManager.addAccount(diskAcct);
-      claimed.add(accountManager.accounts.length - 1);
-      added++;
-      console.log(`[TeamClaude] Picked up new account "${diskAcct.name}" from config`);
-      continue;
-    }
-
-    const mgr = accountManager.accounts[mgrIdx];
-
-    // Backfill org identity and pick up renames/priority onto the running
-    // account (e.g. after disk-side org disambiguation or a `priority` change).
-    if (diskAcct.orgUuid && !mgr.orgUuid) mgr.orgUuid = diskAcct.orgUuid;
-    if (diskAcct.orgName && !mgr.orgName) mgr.orgName = diskAcct.orgName;
-    if (diskAcct.name && mgr.name !== diskAcct.name) mgr.name = diskAcct.name;
-    if (diskAcct.priority != null && mgr.priority !== diskAcct.priority) mgr.priority = diskAcct.priority;
-    // Pick up enable/disable toggles; re-enabling clears a stuck error state.
-    const wantDisabled = !!diskAcct.disabled;
-    if (mgr.disabled !== wantDisabled) accountManager.setDisabled(mgr.index, wantDisabled);
-
-    // Existing account — resolve fresh credentials from disk
-    let freshCred = null;
-    if (diskAcct.type === 'oauth' && diskAcct.importFrom) {
-      try {
-        const creds = await importCredentials(diskAcct.importFrom);
-        freshCred = { accessToken: creds.accessToken, refreshToken: creds.refreshToken, expiresAt: creds.expiresAt };
-      } catch (err) {
-        console.error(`[TeamClaude] Re-import failed for "${diskAcct.name}": ${err.message}`);
-      }
-    } else if (diskAcct.type === 'oauth' && diskAcct.accessToken) {
-      freshCred = { accessToken: diskAcct.accessToken, refreshToken: diskAcct.refreshToken, expiresAt: diskAcct.expiresAt };
-    } else if (diskAcct.type === 'apikey' && diskAcct.apiKey) {
-      freshCred = { apiKey: diskAcct.apiKey };
-    }
-
-    if (!freshCred) continue;
-
-    if (freshCred.accessToken) {
-      const changed = mgr.credential !== freshCred.accessToken ||
-        mgr.refreshToken !== freshCred.refreshToken;
-      // Don't overwrite in-memory credentials with staler ones from disk
-      // (e.g. after a TUI import updated the AM before saveConfig wrote to disk)
-      const diskIsStaler = freshCred.expiresAt && mgr.expiresAt &&
-        freshCred.expiresAt < mgr.expiresAt;
-      if (changed && !diskIsStaler) {
-        accountManager.updateAccountTokens(mgr.index, freshCred);
-        console.log(`[TeamClaude] Refreshed credentials for "${mgr.name}"`);
-      }
-    } else if (freshCred.apiKey && mgr.credential !== freshCred.apiKey) {
-      mgr.credential = freshCred.apiKey;
-      if (mgr.status === 'error') mgr.status = 'active';
-      console.log(`[TeamClaude] Updated API key for "${mgr.name}"`);
-    }
-  }
-  return added;
-}
 
 // ── helpers ─────────────────────────────────────────────────
 

@@ -358,6 +358,17 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: '(blocked)', status: 400, model, sessionId });
         return;
       }
+      // A /tc-acct pin intentionally bypasses route/quota/disabled selection,
+      // but a closed adapter's finite model contract is not a preference. Reject
+      // locally rather than knowingly forwarding an untranslated id into the
+      // same non-retryable 400 that pins were being used to debug.
+      const pinnedAccount = pinnedIndex != null ? accountManager.accounts[pinnedIndex] : null;
+      if (pinnedAccount && model && !accountManager._acceptsModel(pinnedAccount, model)) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: `Pinned account "${pinnedAccount.name}" cannot translate model "${model}" to an accepted provider model.` } }));
+        hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: pinnedAccount.name, status: 400, model, sessionId });
+        return;
+      }
 
       const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, holdBudgetMs: holdMs, sessionId };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
@@ -734,6 +745,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // client that disconnects while waiting just drops out.
     if (!await accountManager.admit(account.index, () => res.destroyed)) return;
     let upstreamRes;
+    const attemptStartedAt = Date.now();
     try {
       upstreamRes = await upstreamFetch(upstreamUrl, {
         method,
@@ -753,6 +765,30 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       }
     }
     accountManager.updateQuota(account.index, rateLimitHeaders);
+
+    // Custom-adapter health is account-specific. A locally supervised adapter
+    // returning 502/503/504 means THIS provider path is unhealthy, unlike an
+    // arbitrary model/client 4xx (never retry) or Anthropic's quota/rate 429
+    // (handled below). Open its circuit and try another eligible account before
+    // any response headers reach the client. The response body is discarded so
+    // the underlying socket returns to the pool cleanly.
+    if (account.upstream && [502, 503, 504].includes(upstreamRes.status)) {
+      accountManager.noteProviderResult(account.index, {
+        ok: false, status: upstreamRes.status, latencyMs: Date.now() - attemptStartedAt,
+      });
+      if (retryCount < maxRetries && !res.headersSent) {
+        await upstreamRes.body?.cancel();
+        console.log(`[TeamClaude] Custom upstream ${upstreamRes.status} on "${account.name}" — circuit open, failing over`);
+        ctx.tried.add(account.index);
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+      }
+    } else if (account.upstream) {
+      // Reachable provider. A 4xx may be a bad request/model and remains
+      // non-retryable, but it proves the adapter path itself is healthy.
+      accountManager.noteProviderResult(account.index, {
+        ok: true, status: upstreamRes.status, latencyMs: Date.now() - attemptStartedAt,
+      });
+    }
 
     // Any non-429 response is live proof a rate-limit hold no longer binds —
     // this is what lets a revalidation probe (a throttled account selected by
@@ -927,6 +963,18 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         err.code === 'ECONNRESET' || err.code === 'ECONNREFUSED' ||
         err.code === 'ETIMEDOUT' || err.code === 'UND_ERR_CONNECT_TIMEOUT' ||
         err.code === 'UND_ERR_HEADERS_TIMEOUT' || err.code === 'UND_ERR_BODY_TIMEOUT');
+
+    // A custom loopback/provider adapter is an independent failure domain. A
+    // connection error to its own upstream is NOT a poisoned process-wide
+    // Anthropic socket pool: open that account's circuit and try the next route
+    // candidate before headers. Real Anthropic keeps the established destroy +
+    // client-retry behavior below.
+    if (isTransient && account.upstream && retryCount < maxRetries && !res.headersSent) {
+      accountManager.noteProviderResult(account.index, { ok: false, error: err.message });
+      ctx.tried.add(account.index);
+      console.log(`[TeamClaude] Custom upstream transport failure on "${account.name}" — circuit open, failing over`);
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+    }
 
     // Transient network errors (including a stale-socket headers/body timeout):
     // close the connection and let the client retry. Failing over to another

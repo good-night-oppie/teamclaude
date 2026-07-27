@@ -34,6 +34,7 @@ import {
   normalizeRoutes,
   normalizeAccounts,
   accountAllows,
+  accountAcceptsModel,
   routeForModel,
   blockedBy,
   clientAllowlistVerdict,
@@ -67,6 +68,8 @@ export function checkConfig(config, opts = {}) {
   checkDeclarationShapes(config, add);
   checkOwnership(config, routes, accounts, add);
   checkModelMaps(config, routes, accounts, add);
+  checkCapabilities(config, routes, accounts, opts.availableModels, add);
+  checkDynamicPolicy(config, accounts, add);
   checkAccountNamesAsModels(config, accounts, opts.availableModels, add);
   checkAllowlistDrift(config, opts, add);
 
@@ -236,6 +239,58 @@ function checkModelMaps(config, routes, accounts, add) {
       + 'The translation is dead code.',
       [r ? `add "${a.name}" to route "${r.name}", or add a route matching those ids before it` : `add a route: teamclaude route add ${a.name} --match "<glob>" --accounts "${a.name}"`,
         `teamclaude explain ${dead[0]}`]);
+  }
+}
+
+// ── closed-provider capability holes ──
+
+function checkCapabilities(config, routes, accounts, availableModels, add) {
+  const ids = new Set(Array.isArray(availableModels) ? availableModels.filter(x => typeof x === 'string') : []);
+  for (const a of accounts) {
+    if (a.modelMap) for (const k of Object.keys(a.modelMap)) ids.add(k);
+    if (a.models) for (const m of a.models) if (typeof m === 'string') ids.add(m.replace(/\[\d+m\]$/, ''));
+  }
+  for (const a of accounts) {
+    if (!a.strictModelMap && !a.acceptsModels?.length) continue;
+    const holes = [];
+    for (const id of ids) {
+      if (blockedBy(config?.blockedModels, id)) continue;
+      if (!accountAllows(routes, accounts, a, id)) continue;
+      if (!accountAcceptsModel(a, id)) holes.push(id);
+    }
+    if (!holes.length) continue;
+    add('error', 'route-capability-hole', a.name,
+      `account "${a.name}" is eligible by the route table for ${holes.length} concrete model id(s) that its closed provider capability rejects: ${holes.join(', ')}. `
+      + 'Without the capability gate, selection forwards those ids into a non-retryable provider 400 and the fallback chain stops.',
+      [`add valid modelMap entries whose targets are in acceptsModels, or remove "${a.name}" from the matching routes`,
+        `teamclaude explain ${holes[0]}`]);
+  }
+}
+
+// ── dynamic ranking activation / evidence ──
+
+function checkDynamicPolicy(config, accounts, add) {
+  const mode = config?.routingPolicy?.mode || 'priority-first';
+  const priorities = new Set(accounts.map(a => a.priority));
+  if (mode === 'priority-first' && priorities.size === accounts.length && accounts.length > 1) {
+    add('info', 'dynamic-ranking-inert', 'routingPolicy',
+      `all ${accounts.length} accounts have distinct priority values and mode is "priority-first", so reset-time ranking can never decide between two accounts — routing is entirely static priority.`,
+      ['set routingPolicy.mode to "shadow" first, observe /teamclaude/status shadowDecisions, then promote to "dynamic"',
+        'define costTier as the hard economic boundary; do not use one unique priority per account as a tier']);
+  }
+  if (mode === 'dynamic' || mode === 'shadow') {
+    const tiers = new Map();
+    for (const a of accounts) {
+      const n = a.costTier;
+      if (!tiers.has(n)) tiers.set(n, []);
+      tiers.get(n).push(a.name);
+    }
+    if ([...tiers.values()].every(xs => xs.length === 1)) {
+      add('warn', 'dynamic-singleton-tiers', 'routingPolicy',
+        'every costTier contains exactly one account, so dynamic ranking has no choice inside any tier and degenerates to static tier order.',
+        ['put economically equivalent accounts in the same costTier',
+          'use priority only as the final deterministic tie-break inside a tier']);
+    }
   }
 }
 
