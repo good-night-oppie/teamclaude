@@ -2,6 +2,7 @@ import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired } from './oauth
 import { sameIdentity } from './identity.js';
 import { weeklyBucketForModel, modelGlobMatches } from './model.js';
 import { SessionTracker } from './session-tracker.js';
+import { invalidateNormalizedConfigView } from './model-namespace.js';
 
 // Re-exported for callers that import these model helpers from here.
 export { isFableModel, parseRequestModel, parseAdvisorModel } from './model.js';
@@ -860,6 +861,9 @@ export class AccountManager {
         if (name !== 'fable' && name !== 'sonnet' && !names.has(name)) this.routePins.delete(name);
       }
     }
+    // TUI / reload route edits land here; drop the ingress collision cache so a
+    // renamed route account list is visible on the next request.
+    invalidateNormalizedConfigView();
   }
 
   /** The first configured route whose globs match `model`, or null. */

@@ -9,7 +9,7 @@ import { patchAccountUuid } from './account-uuid-rewrite.js';
 import { sanitizeToolPairs } from './tool-pair-sanitize.js';
 import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
 import { TopLevelFieldFinder, stripAdvisorModelField } from './model.js';
-import { requestModelIds, blockedIdInSet } from './model-namespace.js';
+import { requestModelIds, blockedIdInSet, collisionIdInSet } from './model-namespace.js';
 import { BodyWriter } from './request-log.js';
 import { upstreamFetch } from './upstream-fetch.js';
 import { tunnelTls } from './sx.js';
@@ -361,6 +361,37 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         body = stripAdvisorModelField(body);
         accountManager.noteAdvisorDegrade('blocked', advisorModel, blockHit.pattern);
         advisorModel = null;
+      }
+      // Account-name collision (T1): raw-BASE_URL clients bypass `teamclaude run`
+      // preflight, so a request whose model id is really a configured ACCOUNT
+      // name can egress verbatim and 404 (kimi-k3 incident class). Reject only
+      // when routabilityOf can PROVE the collision — never guess-forward.
+      // /tc-acct pins bypass selection, so the proof does not apply there.
+      if (pinnedIndex == null) {
+        const collisionHit = collisionIdInSet(
+          config, requestModelIds({ model, advisorModel }), { executor: model },
+        );
+        if (collisionHit?.role === 'executor') {
+          if (!res.headersSent) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+              type: 'error',
+              error: {
+                type: 'invalid_request_error',
+                message: `Model "${collisionHit.id}" collides with configured account "${collisionHit.id}" and is not `
+                  + 'routable as a model id. If you meant the account, pin it: /tc-acct or '
+                  + `teamclaude run --account ${collisionHit.id}`,
+              },
+            }));
+          }
+          hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: '(collision)', status: 400, model, sessionId });
+          return;
+        }
+        if (collisionHit?.role === 'advisor' && advisorModel) {
+          body = stripAdvisorModelField(body);
+          accountManager.noteAdvisorDegrade('collision', advisorModel, collisionHit.id);
+          advisorModel = null;
+        }
       }
       // A /tc-acct pin intentionally bypasses route/quota/disabled selection,
       // but a closed adapter's finite model contract is not a preference. Reject

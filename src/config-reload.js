@@ -12,6 +12,7 @@
 // modelMap/blockedModels the operator just removed.
 
 import { sameIdentity } from './identity.js';
+import { invalidateNormalizedConfigView } from './model-namespace.js';
 
 function findConfigAccount(config, account) {
   if (!Array.isArray(config?.accounts)) return -1;
@@ -105,11 +106,15 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
         accountManager.updateAccountTokens(mgr.index, freshCred);
         log(`[TeamClaude] Refreshed credentials for "${mgr.name}"`);
       }
-    } else if (freshCred.apiKey && mgr.credential !== freshCred.apiKey) {
+    } else     if (freshCred.apiKey && mgr.credential !== freshCred.apiKey) {
       mgr.credential = freshCred.apiKey;
       if (mgr.status === 'error') mgr.status = 'active';
       log(`[TeamClaude] Updated API key for "${mgr.name}"`);
     }
   }
+  // Hot-swap boundary: accounts/blockedModels on memConfig just changed; drop
+  // the ingress collision gate's normalized-view cache so the next request
+  // re-reads the new identity (fingerprint miss would also suffice).
+  invalidateNormalizedConfigView();
   return added;
 }

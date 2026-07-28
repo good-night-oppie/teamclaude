@@ -11,6 +11,7 @@ import {
   accountAcceptsModel,
   accountAcceptsAllIds,
   requestModelIds,
+  collisionIdInSet,
   pinnedRoutabilityOf,
   resolveAccountToken,
   CLAUDE_CODE_GATE_MODELED_VERSION,
@@ -450,6 +451,32 @@ test('requestModelIds + accountAcceptsAllIds pins set-quantified gates to select
         && am._isAvailable(a, model, null)); // quota/route may still exclude
     }
   }
+});
+
+test('collisionIdInSet pins the ingress collision gate to routabilityOf.accountNameCollision', () => {
+  // Same cross-product discipline as accountAllows/_routeAllows: the server call
+  // site must not drift from the oracle's four-condition proof.
+  const config = liveConfig();
+  const models = [
+    'deepseek-v4-pro', 'deepseek-v4-flash', 'kimi-k3', 'claude-opus-4-8',
+    'claude-nonexistent-9', 'primary@example.com', 'sakana-fugu',
+  ];
+  for (const model of models) {
+    const oracle = routabilityOf(config, model);
+    const hit = collisionIdInSet(config, [model], { executor: model });
+    assert.equal(!!hit, !!oracle.accountNameCollision, `ingress vs oracle on ${model}`);
+    if (oracle.accountNameCollision) {
+      assert.equal(oracle.routable, false);
+      assert.equal(oracle.isAccountName, true);
+      assert.equal(hit.id, model);
+      assert.equal(hit.role, 'executor');
+    }
+  }
+  // Advisor-only collision must not be reported as executor.
+  const ids = requestModelIds({ model: 'claude-opus-4-8', advisorModel: 'deepseek-v4-pro' });
+  const adv = collisionIdInSet(config, ids, { executor: 'claude-opus-4-8' });
+  assert.equal(adv?.role, 'advisor');
+  assert.equal(adv?.id, 'deepseek-v4-pro');
 });
 
 test('normalizeRoutes matches AccountManager.setRoutes: unusable globs drop the route, scalars become arrays', () => {

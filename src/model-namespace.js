@@ -128,6 +128,60 @@ export function normalizeAccounts(accounts) {
   }));
 }
 
+// Normalized accounts/routes are pure functions of the config's routing-relevant
+// fields. The ingress collision gate calls routabilityOf on every request, so
+// cache the normalized view keyed on that identity rather than re-walking the
+// tables. A fingerprint (not object identity) is required: reload and the TUI
+// mutate accounts/routes/blockedModels in place on the same config object.
+let _normalizedViewKey = null;
+let _normalizedView = null;
+
+/** Stable fingerprint of the fields routabilityOf / collisionIdInSet read. */
+export function configIdentityKey(config) {
+  const accounts = Array.isArray(config?.accounts) ? config.accounts : [];
+  const routes = Array.isArray(config?.routes) ? config.routes : [];
+  const blocked = Array.isArray(config?.blockedModels) ? config.blockedModels : [];
+  const aPart = accounts.map(a => [
+    a?.name ?? '',
+    a?.upstream ? '1' : '0',
+    a?.disabled ? '1' : '0',
+    String(a?.priority ?? 0),
+    a?.modelMap ? Object.keys(a.modelMap).sort().join(',') : '',
+    Array.isArray(a?.models) ? a.models.join(',') : '',
+    a?.strictModelMap ? '1' : '0',
+    Array.isArray(a?.acceptsModels) ? [...a.acceptsModels].map(String).sort().join(',') : '',
+  ].join('\x1f')).join('\x1e');
+  const rPart = routes.map(r => {
+    const match = Array.isArray(r?.match) ? r.match : [r?.match];
+    const acct = Array.isArray(r?.accounts) ? r.accounts.map(String) : [];
+    const tiers = Array.isArray(r?.tiers)
+      ? r.tiers.map(t => `${t?.name ?? ''}:${(Array.isArray(t?.accounts) ? t.accounts : []).map(String).join(',')}`).join(';')
+      : '';
+    return [r?.name ?? '', match.map(String).join(','), acct.join(','), tiers].join('\x1f');
+  }).join('\x1e');
+  return `a=${aPart}\nr=${rPart}\nb=${blocked.map(String).join(',')}`;
+}
+
+/** Drop the cached normalized view. Called from the config-reload hot-swap and
+ * AccountManager.setRoutes; fingerprint mismatch also misses without this. */
+export function invalidateNormalizedConfigView() {
+  _normalizedViewKey = null;
+  _normalizedView = null;
+}
+
+/** Normalized {accounts, routes, blocked} for `config`, cached by identity key. */
+export function normalizedConfigView(config) {
+  const key = configIdentityKey(config);
+  if (_normalizedView && _normalizedViewKey === key) return _normalizedView;
+  _normalizedView = {
+    accounts: normalizeAccounts(config?.accounts),
+    routes: normalizeRoutes(config?.routes),
+    blocked: Array.isArray(config?.blockedModels) ? [...config.blockedModels] : [],
+  };
+  _normalizedViewKey = key;
+  return _normalizedView;
+}
+
 // ── routing predicates (mirror of AccountManager) ───────────
 
 /** The first configured route whose globs match `model`, or null. First match
@@ -234,6 +288,24 @@ export function blockedIdInSet(blockedModels, ids, { executor = null } = {}) {
 export function accountAcceptsAllIds(account, ids) {
   if (!Array.isArray(ids) || !ids.length) return true;
   return ids.every(id => accountAcceptsModel(account, id));
+}
+
+/** First provable account-name collision across the id set, or null. Walks ids
+ * in caller order (executor first via requestModelIds) so a dual hit reports
+ * the executor — which still 400s. An advisor-only hit is what strip-and-degrade
+ * consumes. Reuses routabilityOf.accountNameCollision; never re-derives the
+ * four-condition proof. */
+export function collisionIdInSet(config, ids, { executor = null } = {}) {
+  if (!Array.isArray(ids)) return null;
+  for (let i = 0; i < ids.length; i++) {
+    const id = ids[i];
+    if (typeof id !== 'string' || !id) continue;
+    const verdict = routabilityOf(config, id);
+    if (!verdict.accountNameCollision) continue;
+    const role = (executor != null ? id === executor : i === 0) ? 'executor' : 'advisor';
+    return { id, role, accountName: id };
+  }
+  return null;
 }
 
 /** Every `blockedModels` glob that rejects `model`, in config order. The proxy
@@ -402,10 +474,14 @@ export function deriveNamespace(config) {
  * ranking selection uses; live quota can still pick a different one.
  */
 export function routabilityOf(config, model) {
-  const accounts = normalizeAccounts(config?.accounts);
-  const routes = normalizeRoutes(config?.routes);
-  const blocked = Array.isArray(config?.blockedModels) ? config.blockedModels : [];
-  const empty = { routable: false, route: null, candidates: [], blockedBy: null };
+  const view = normalizedConfigView(config);
+  const accounts = view.accounts;
+  const routes = view.routes;
+  const blocked = view.blocked;
+  const empty = {
+    routable: false, route: null, candidates: [], blockedBy: null,
+    isAccountName: false, accountNameCollision: false,
+  };
 
   if (typeof model !== 'string' || !model) {
     return { ...empty, reason: 'no model id given' };
@@ -527,7 +603,10 @@ export function routabilityOf(config, model) {
       + `${first.mappedTo ? ` (rewritten upstream to "${first.mappedTo}")` : ''}.${passthroughNote}${opaqueCollisionNote}`;
   }
 
-  return { routable, reason, route, candidates, blockedBy: null, isAccountName: !!collision };
+  return {
+    routable, reason, route, candidates, blockedBy: null,
+    isAccountName: !!collision, accountNameCollision: collided,
+  };
 }
 
 // ── pinned routability (/tc-acct) ───────────────────────────
