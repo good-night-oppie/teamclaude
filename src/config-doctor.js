@@ -278,6 +278,28 @@ function checkDynamicPolicy(config, accounts, add) {
       ['set routingPolicy.mode to "shadow" first, observe /teamclaude/status shadowDecisions, then promote to "dynamic"',
         'define costTier as the hard economic boundary; do not use one unique priority per account as a tier']);
   }
+
+  const routes = Array.isArray(config?.routes) ? config.routes : [];
+  const declaredCostTiers = accounts.filter(a => Number.isFinite(a.costTier) && a.costTier !== 0);
+  const routesWithTiers = routes.filter(r => Array.isArray(r?.tiers) && r.tiers.length > 0);
+
+  // costTier / route tiers only reshape selection in dynamic mode. Declaring
+  // them under priority-first (or shadow, which serves legacy) is the same
+  // "looks effective, silently inert" class the doctor already owns.
+  if (mode !== 'dynamic' && (declaredCostTiers.length || routesWithTiers.length)) {
+    const bits = [];
+    if (declaredCostTiers.length) {
+      bits.push(`${declaredCostTiers.length} account(s) declare a non-zero costTier`);
+    }
+    if (routesWithTiers.length) {
+      bits.push(`${routesWithTiers.length} route(s) declare tiers[]`);
+    }
+    add('warn', 'cost-tiers-inert', 'routingPolicy',
+      `${bits.join(' and ')}, but routingPolicy.mode is "${mode}" — those declarations do not affect which account serves a request until mode is "dynamic".`,
+      ['set routingPolicy.mode to "shadow" to observe disagreement without changing traffic, then promote to "dynamic"',
+        'or remove unused costTier / route tiers[] so the config matches what the data plane actually does']);
+  }
+
   if (mode === 'dynamic' || mode === 'shadow') {
     const tiers = new Map();
     for (const a of accounts) {
@@ -291,6 +313,17 @@ function checkDynamicPolicy(config, accounts, add) {
         ['put economically equivalent accounts in the same costTier',
           'use priority only as the final deterministic tie-break inside a tier']);
     }
+  }
+
+  // All-defaults economics under dynamic: every account at costTier 0 and no
+  // route tiers[] → ranking reduces to soonest-reset-wins with no hard
+  // economic boundary between subscription and metered accounts.
+  if (mode === 'dynamic' && accounts.length > 1
+      && declaredCostTiers.length === 0 && routesWithTiers.length === 0) {
+    add('warn', 'dynamic-all-defaults', 'routingPolicy',
+      `routingPolicy.mode is "dynamic" but every account has the default costTier (0) and no route declares tiers[] — ranking has no economic boundary and reduces to soonest-reset-wins across the whole fleet.`,
+      ['set costTier (or route tiers[]) so subscription and metered accounts do not share one unbounded tier',
+        'run teamclaude rank <model> --json against the persisted quota snapshot before promoting further']);
   }
 }
 
