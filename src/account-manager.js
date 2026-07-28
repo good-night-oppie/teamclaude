@@ -1842,6 +1842,11 @@ export class AccountManager {
       if (idx === index) this.routePins.delete(name);
       else if (idx > index) this.routePins.set(name, idx - 1);
     }
+    // Dynamic no-session maps store account indices. Any splice invalidates them
+    // (values >= index are off-by-one or dangling). Clear both rather than
+    // per-key surgery: the next request re-evaluates with a fresh timestamp.
+    this._dynamicCurrentByKey.clear();
+    this._dynamicEvalAtByKey.clear();
   }
 
   /**

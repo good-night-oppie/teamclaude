@@ -450,3 +450,24 @@ test('probe-held recursion records exactly one shadow decision', () => {
   assert.equal(am._shadowDecisions.total, 1,
     'probe-held recursion must not double-count shadow evidence');
 });
+
+// ── T9: dynamic-only correctness ───────────────────────────────────────────
+
+test('T9-1: removeAccount reindexes dynamic maps so stickiness still names the same account', () => {
+  const am = new AccountManager([
+    oauth('a'), oauth('b'), oauth('c'),
+  ], 0.98, { routingPolicy: { mode: 'dynamic', reevaluateMs: 300000 } });
+  measured(am, 0, { r7: NOW + 90 * H });
+  measured(am, 1, { r7: NOW + H });
+  measured(am, 2, { r7: NOW + 50 * H });
+  const model = 'claude-opus-4-8';
+  const key = am._dynamicKey(model);
+  // Stick the no-session key on B (index 1).
+  am._dynamicCurrentByKey.set(key, 1);
+  am._dynamicEvalAtByKey.set(key, Date.now());
+  am.currentIndex = 1;
+  am.removeAccount(0); // drop A; B must remain B, not shift onto former C
+  assert.equal(am.accounts[0].name, 'b');
+  assert.equal(am.getActiveAccount(null, model).name, 'b',
+    'dynamic stickiness must follow B after the index shift, not land on C or undefined');
+});
