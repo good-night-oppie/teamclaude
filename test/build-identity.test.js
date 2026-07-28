@@ -24,6 +24,7 @@ const EXPECTED_FEATURES = [
   'model-preflight',
   'quota-admission-gate',
   'serveable-availability',
+  'sessions-endpoint',
 ];
 
 const pkgVersion = JSON.parse(

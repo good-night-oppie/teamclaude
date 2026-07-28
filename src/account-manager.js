@@ -563,18 +563,37 @@ export class AccountManager {
 
   /** Mark a session request as in flight / finished. Paired around the whole
    * client request (including retries) so a long streaming completion keeps the
-   * session counted as active for its full duration. */
-  beginSession(sessionId) {
+   * session counted as active for its full duration.
+   * `semantic` (T5): only /v1/messages POSTs stamp lastSemanticSeen / clear
+   * client_hint — event_logging traffic also hits beginSession and must not. */
+  beginSession(sessionId, { semantic = false, pathClass, model, account } = {}) {
     if (sessionId) this.sessionTracker.beginRequest(sessionId);
+    if (sessionId && semantic) {
+      this.sessionTracker.noteSemanticBegin(sessionId, { pathClass, model, account });
+    }
   }
 
-  endSession(sessionId) {
+  endSession(sessionId, { semantic = false } = {}) {
+    if (sessionId && semantic) this.sessionTracker.noteSemanticEnd(sessionId);
     if (sessionId) this.sessionTracker.endRequest(sessionId);
   }
 
   /** { known, active, perAccount } session counts for status/TUI. */
   sessionStats() {
     return this.sessionTracker.stats();
+  }
+
+  /**
+   * Pure read for GET /teamclaude/sessions. Joins routing pins with the T5
+   * evidence Map — does not sweep, claim probes, or mutate breaker/quota.
+   */
+  getSessions(config = {}, now = Date.now()) {
+    const accountNames = this.accounts.map(a => a.name);
+    const sessions = this.sessionTracker.snapshot(now, {
+      contextWindows: config?.contextWindows || null,
+      accountNames,
+    });
+    return { sessions, accountNames };
   }
 
   /**

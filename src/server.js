@@ -13,7 +13,7 @@ import { requestModelIds, blockedIdInSet, collisionIdInSet } from './model-names
 import { BodyWriter } from './request-log.js';
 import { upstreamFetch } from './upstream-fetch.js';
 import { tunnelTls } from './sx.js';
-import { buildIdentity, registerBuildFeature } from './build-identity.js';
+import { buildIdentity, PROCESS_STARTED_AT, registerBuildFeature } from './build-identity.js';
 // Ensure the model-preflight layer's tag is registered even when the CLI entry
 // has not been loaded (status via createProxyServer alone).
 import './model-preflight.js';
@@ -22,6 +22,36 @@ registerBuildFeature('audit-b1-b6');
 registerBuildFeature('ingress-collision-gate');
 registerBuildFeature('serveable-availability');
 registerBuildFeature('quota-admission-gate');
+registerBuildFeature('sessions-endpoint');
+
+/** Path class for T5 last_request / ctx gating. */
+export function classifySessionPath(url) {
+  const path = (url || '').split('?')[0];
+  if (path === '/v1/messages/count_tokens') return 'count_tokens';
+  if (path === '/v1/messages') return 'messages';
+  return 'other';}
+
+/** Semantic = POST /v1/messages or /v1/messages/count_tokens (not event_logging). */
+export function isSemanticSessionRequest(method, url) {
+  if ((method || '').toUpperCase() !== 'POST') return false;
+  const cls = classifySessionPath(url);
+  return cls === 'messages' || cls === 'count_tokens';
+}
+
+const SESSIONS_ABSENT = {
+  awaiting_permission:
+    'unobservable at proxy: client-side dialog, no request in flight — indistinguishable from idle; see client_hint seam',
+  pane_binding:
+    'proxy has no process/tmux visibility; session_id→pane join stays fleet-side',
+  typed_draft: 'unsubmitted input never produces a request',
+  // Fix #6: message_start input+cache excludes this turn's output.
+  current_turn_output_tokens:
+    'context_tokens is observed from message_start (input+cache_read+cache_creation) and lags by one turn\'s output, '
+    + 'which occupies the window from the next turn; message_delta output_tokens are not added to the numerator',
+  // Fix #5: count_tokens body is top-level {input_tokens} with no .usage wrapper.
+  count_tokens_ctx:
+    'count_tokens responses are excluded from ctx recording (top-level input_tokens, no usage/cache sum) — only /v1/messages usage is observed',
+};
 
 
 export const HOP_BY_HOP_HEADERS = new Set([
@@ -115,6 +145,48 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
         const body = accountManager.getServeable(model);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(body, null, 2));
+        return;
+      }
+
+      // T5 honest session-state — pure read; evidence Map only (routing pins
+      // untouched). Exposes only proxy-observable facts with provenance labels.
+      if (req.method === 'GET' && req.url === '/teamclaude/sessions') {
+        const now = Date.now();
+        const { sessions } = accountManager.getSessions(config, now);
+        const build = buildIdentity();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          schema: 'teamclaude.sessions.v1',
+          now: new Date(now).toISOString(),
+          server: { startedAt: PROCESS_STARTED_AT, build },
+          observed_since: PROCESS_STARTED_AT,
+          sessions,
+          absent: SESSIONS_ABSENT,
+        }, null, 2));
+        return;
+      }
+
+      // Optional client-cooperation seam for awaiting_permission (T5). Never
+      // fabricates sessions; never merges into `state`.
+      if (req.method === 'POST' && req.url === '/teamclaude/session-hint') {
+        const chunks = [];
+        for await (const chunk of req) chunks.push(chunk);
+        let payload = null;
+        try { payload = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'); } catch { /* invalid */ }
+        const sessionId = payload?.session_id;
+        const state = payload?.state;
+        if (!sessionId || (state !== 'awaiting_permission' && state !== 'clear')) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ stored: false, reason: 'invalid-body' }));
+          return;
+        }
+        const result = accountManager.sessionTracker.noteHint(sessionId, {
+          state,
+          at: new Date().toISOString(),
+          source: payload.source || 'claude-hook',
+        });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
         return;
       }
 
@@ -376,6 +448,11 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // over the auxiliary channel, and never egress the blocked advisor id.
       const blockHit = blockedIdInSet(config?.blockedModels, requestModelIds({ model, advisorModel }), { executor: model });
       if (blockHit?.role === 'executor') {
+        if (sessionId && isSemanticSessionRequest(req.method, req.url)) {
+          accountManager.sessionTracker.noteSemanticRejection(sessionId, {
+            status: 400, reason: 'blocked-model', model, pathClass: classifySessionPath(req.url),
+          });
+        }
         if (!res.headersSent) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: `Model "${model}" is blocked by teamclaude (matched "${blockHit.pattern}").` } }));
@@ -398,6 +475,11 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
           config, requestModelIds({ model, advisorModel }), { executor: model },
         );
         if (collisionHit?.role === 'executor') {
+          if (sessionId && isSemanticSessionRequest(req.method, req.url)) {
+            accountManager.sessionTracker.noteSemanticRejection(sessionId, {
+              status: 400, reason: 'account-name-collision', model, pathClass: classifySessionPath(req.url),
+            });
+          }
           if (!res.headersSent) {
             res.writeHead(400, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({
@@ -457,6 +539,11 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
           reason: accountManager._unavailableReason(a, model) || 'unavailable',
         }));
         if (reasons.some(r => CAPACITY.has(r.reason))) {
+          if (sessionId && isSemanticSessionRequest(req.method, req.url)) {
+            accountManager.sessionTracker.noteSemanticRejection(sessionId, {
+              status: 429, reason: 'quota-admission', model, pathClass: classifySessionPath(req.url),
+            });
+          }
           const snap = accountManager.getServeable(model);
           let retryAfter = 60;
           if (snap.soonestResetAt) {
@@ -484,12 +571,17 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         }
       }
 
+      const pathClass = classifySessionPath(req.url);
+      const semantic = isSemanticSessionRequest(req.method, req.url);
       // reauthed: upstream #136 401-retry bound (one forced refresh per account per request)
-      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, holdBudgetMs: holdMs, sessionId };
+      const ctx = {
+        account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel,
+        pinnedIndex, holdBudgetMs: holdMs, sessionId, pathClass, semantic,
+      };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
-      // never expires mid-request.
-      accountManager.beginSession(sessionId);
+      // never expires mid-request. Semantic stamp/hint-clear only for /v1/messages*.
+      accountManager.beginSession(sessionId, { semantic, pathClass, model });
       try {
         await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir, sx);
       } catch (err) {
@@ -500,7 +592,12 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
           res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Internal proxy error' } }));
         }
       } finally {
-        accountManager.endSession(sessionId);
+        // Update last_request.account once selection is known (begin was pre-select).
+        if (semantic && sessionId && ctx.account) {
+          const ev = accountManager.sessionTracker.evidence.get(sessionId);
+          if (ev?.lastRequest) ev.lastRequest.account = ctx.account;
+        }
+        accountManager.endSession(sessionId, { semantic });
         if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, sessionId, pinned: ctx.pinnedIndex != null });
       }
     } catch (err) {
@@ -1071,11 +1168,19 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // whole (potentially ~1M-token) SSE body in memory.
       const l = getLog();
       const bw = l ? l.bodyWriter('RESPONSE BODY (streamed)', contentType) : null;
-      await streamResponse(upstreamRes.body, res, account.index, accountManager, bw);
+      await streamResponse(upstreamRes.body, res, account.index, accountManager, bw, {
+        sessionId: ctx.sessionId,
+        model: ctx.model,
+        pathClass: ctx.pathClass,
+      });
       l?.end();
     } else {
       const buf = Buffer.from(await upstreamRes.arrayBuffer());
-      extractUsageFromBody(buf, account.index, accountManager);
+      extractUsageFromBody(buf, account.index, accountManager, {
+        sessionId: ctx.sessionId,
+        model: ctx.model,
+        pathClass: ctx.pathClass,
+      });
       const l = getLog();
       if (l) { l.body('RESPONSE BODY', buf, contentType); l.end(); }
       res.end(buf);
@@ -1185,8 +1290,9 @@ export function readWithIdleTimeout(reader, ms) {
 
 /**
  * Stream an SSE response to the client, parsing usage data along the way.
+ * `sessionCtx` (optional): { sessionId, model, pathClass } for T5 ctx recording.
  */
-async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter) {
+async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, sessionCtx = null) {
   const reader = webStream.getReader();
   const idleMs = resolveBodyIdleTimeout();
   const decoder = new TextDecoder();
@@ -1215,7 +1321,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
       sseBuffer = events.pop(); // keep incomplete event
 
       for (const event of events) {
-        parseSSEUsage(event, accountIndex, accountManager);
+        parseSSEUsage(event, accountIndex, accountManager, sessionCtx);
       }
 
       // Handle backpressure — also bail out if client disconnects,
@@ -1235,7 +1341,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
 
     // Parse any remaining buffer
     if (sseBuffer.trim()) {
-      parseSSEUsage(sseBuffer, accountIndex, accountManager);
+      parseSSEUsage(sseBuffer, accountIndex, accountManager, sessionCtx);
     }
   } catch (err) {
     // A mid-stream idle timeout (or any read error) means the upstream went
@@ -1253,14 +1359,28 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
   }
 }
 
-function parseSSEUsage(event, accountIndex, accountManager) {
+function parseSSEUsage(event, accountIndex, accountManager, sessionCtx = null) {
   const dataLine = event.split('\n').find(l => l.startsWith('data: '));
   if (!dataLine) return;
 
   try {
     const data = JSON.parse(dataLine.slice(6));
     if (data.type === 'message_start' && data.message?.usage) {
-      accountManager.updateUsage(accountIndex, data.message.usage.input_tokens, 0);
+      const u = data.message.usage;
+      accountManager.updateUsage(accountIndex, u.input_tokens, 0);
+      // T5: observed window occupancy = input + cache_read + cache_creation.
+      // Excludes current-turn output (see absent.current_turn_output_tokens).
+      if (sessionCtx?.sessionId && sessionCtx.pathClass !== 'count_tokens') {
+        const contextTokens = (u.input_tokens || 0)
+          + (u.cache_read_input_tokens || 0)
+          + (u.cache_creation_input_tokens || 0);
+        accountManager.sessionTracker.noteUsage(
+          sessionCtx.sessionId,
+          sessionCtx.model,
+          contextTokens,
+          { pathClass: sessionCtx.pathClass || 'messages' },
+        );
+      }
     } else if (data.type === 'message_delta' && data.usage) {
       accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens);
     }
@@ -1269,12 +1389,27 @@ function parseSSEUsage(event, accountIndex, accountManager) {
   }
 }
 
-function extractUsageFromBody(buffer, accountIndex, accountManager) {
+function extractUsageFromBody(buffer, accountIndex, accountManager, sessionCtx = null) {
   try {
     const json = JSON.parse(buffer.toString());
     if (json.usage) {
       accountManager.updateUsage(accountIndex, json.usage.input_tokens, json.usage.output_tokens);
+      // Non-stream /v1/messages: same observed sum; count_tokens excluded.
+      if (sessionCtx?.sessionId && sessionCtx.pathClass !== 'count_tokens') {
+        const u = json.usage;
+        const contextTokens = (u.input_tokens || 0)
+          + (u.cache_read_input_tokens || 0)
+          + (u.cache_creation_input_tokens || 0);
+        accountManager.sessionTracker.noteUsage(
+          sessionCtx.sessionId,
+          sessionCtx.model,
+          contextTokens,
+          { pathClass: sessionCtx.pathClass || 'messages' },
+        );
+      }
     }
+    // count_tokens is top-level {input_tokens} with no .usage — deliberately
+    // NOT recorded into ctx (absent.count_tokens_ctx).
   } catch {
     // not JSON or no usage
   }
