@@ -440,3 +440,53 @@ test('doctor warns when every dynamic cost tier is a singleton', () => {
   assert.equal(f.severity, 'warn');
   assert.match(f.message, /degenerates to static tier order/);
 });
+
+test('doctor warns when costTier/tiers are declared but mode is not dynamic', () => {
+  const byCost = checkConfig({
+    routingPolicy: { mode: 'priority-first' },
+    accounts: [oauth('a', { costTier: 0 }), oauth('b', { costTier: 10, priority: 1 })],
+    routes: [],
+  });
+  const f1 = find(byCost, 'cost-tiers-inert');
+  assert.ok(f1);
+  assert.equal(f1.severity, 'warn');
+  assert.match(f1.message, /costTier/);
+  assert.match(f1.message, /priority-first/);
+
+  const byRoute = checkConfig({
+    routingPolicy: { mode: 'shadow' },
+    accounts: [oauth('a'), oauth('b', { priority: 1 })],
+    routes: [{ name: 'all', match: ['*'], tiers: [
+      { name: 'sub', accounts: ['a'] },
+      { name: 'metered', accounts: ['b'] },
+    ] }],
+  });
+  const f2 = find(byRoute, 'cost-tiers-inert');
+  assert.ok(f2);
+  assert.match(f2.message, /tiers\[\]/);
+  assert.match(f2.message, /shadow/);
+});
+
+test('doctor warns when dynamic mode has all-defaults economics', () => {
+  const findings = checkConfig({
+    routingPolicy: { mode: 'dynamic' },
+    accounts: [oauth('a'), oauth('b', { priority: 1 })],
+    routes: [{ name: 'all', match: ['*'], accounts: ['a', 'b'] }],
+  });
+  const f = find(findings, 'dynamic-all-defaults');
+  assert.ok(f);
+  assert.equal(f.severity, 'warn');
+  assert.match(f.message, /no economic boundary/);
+  assert.equal(find(findings, 'dynamic-singleton-tiers'), undefined,
+    'all costTier=0 is one shared tier, not N singletons');
+});
+
+test('doctor stays quiet on cost-tier inertness when mode is already dynamic', () => {
+  const findings = checkConfig({
+    routingPolicy: { mode: 'dynamic' },
+    accounts: [oauth('a', { costTier: 0 }), oauth('b', { costTier: 10, priority: 1 })],
+    routes: [],
+  });
+  assert.equal(find(findings, 'cost-tiers-inert'), undefined);
+  assert.equal(find(findings, 'dynamic-all-defaults'), undefined);
+});
