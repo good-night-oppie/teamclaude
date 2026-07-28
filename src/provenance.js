@@ -50,6 +50,8 @@ export const PROVENANCE_OUTCOMES = Object.freeze([
   'exhausted-typed-429',
   'pinned-unavailable',
   'upstream-error-relayed',
+  // Upstream #136: OAuth 401 forced-refresh retry (non-final; a new egress follows).
+  'reauth-401-retry',
 ]);
 
 const SAFE_SET = new Set(PROVENANCE_SAFE_FIELDS);

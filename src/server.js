@@ -1256,6 +1256,47 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     }
     accountManager.updateQuota(account.index, rateLimitHeaders);
 
+    // A 401 means the credential we injected was rejected. For an OAuth account
+    // that usually means the access token was revoked BEFORE its clock expiry —
+    // something else refreshed the same token family, so upstream reports it
+    // revoked while it still looks fresh locally. ensureTokenFresh's expiry
+    // check cannot see that (it only compares the clock), so the account would
+    // otherwise keep serving a dead token until the token aged out, and every
+    // request in between would surface a 401 to the client with no recovery.
+    // Force one refresh and retry. If the refresh is itself rejected the refresh
+    // token is dead too: ensureTokenFresh marks the account errored, and the
+    // retry's status check rotates to another account. Bounded to one re-auth
+    // per account per request, so a genuinely dead credential surfaces the 401
+    // instead of looping.
+    //
+    // Handled BEFORE custom-upstream breaker scoring: a 401 is an auth event,
+    // not provider health (must not open the circuit, and must not be scored as
+    // a success that falsely "heals" a half-open probe). The recursive retry is
+    // a NEW selection/egress — release the half-open probe claim first (RF-1),
+    // mirroring the status==='error' retry path.
+    if (upstreamRes.status === 401 && account.type === 'oauth' && account.refreshToken
+        && retryCount < maxRetries && !ctx.reauthed.has(account.index)) {
+      ctx.reauthed.add(account.index);
+      await upstreamRes.body?.cancel();
+      accountManager.releaseCircuitProbe(account.index);
+      emitProvenance(ctx, {
+        _account: account,
+        final: false,
+        outcome: 'reauth-401-retry',
+        response_status: 401,
+        attempt: ctx.attempt,
+        timings: {
+          admit_ms: admitMs,
+          headers_ms: ctx.attemptRec.headers_ms,
+          total_ms: Date.now() - attemptStartedAt,
+        },
+      });
+      console.log(`[TeamClaude] 401 on "${account.name}" — token rejected; forcing refresh and retrying`);
+      await accountManager.ensureTokenFresh(account.index, true);
+      if (res.destroyed) return;
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+    }
+
     // Custom-adapter health is account-specific. A locally supervised adapter
     // returning any 5xx means THIS provider path is unhealthy, unlike an
     // arbitrary model/client 4xx (never retry) or Anthropic's quota/rate 429
@@ -1450,28 +1491,6 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         },
       });
       return;
-    }
-
-    // A 401 means the credential we injected was rejected. For an OAuth account
-    // that usually means the access token was revoked BEFORE its clock expiry —
-    // something else refreshed the same token family, so upstream reports it
-    // revoked while it still looks fresh locally. ensureTokenFresh's expiry
-    // check cannot see that (it only compares the clock), so the account would
-    // otherwise keep serving a dead token until the token aged out, and every
-    // request in between would surface a 401 to the client with no recovery.
-    // Force one refresh and retry. If the refresh is itself rejected the refresh
-    // token is dead too: ensureTokenFresh marks the account errored, and the
-    // retry's status check rotates to another account. Bounded to one re-auth
-    // per account per request, so a genuinely dead credential surfaces the 401
-    // instead of looping.
-    if (upstreamRes.status === 401 && account.type === 'oauth' && account.refreshToken
-        && retryCount < maxRetries && !ctx.reauthed.has(account.index)) {
-      ctx.reauthed.add(account.index);
-      await upstreamRes.body?.cancel();
-      console.log(`[TeamClaude] 401 on "${account.name}" — token rejected; forcing refresh and retrying`);
-      await accountManager.ensureTokenFresh(account.index, true);
-      if (res.destroyed) return;
-      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
 
     // Log the request head (once) followed by the response headers, streaming
