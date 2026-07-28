@@ -422,3 +422,31 @@ test('shadowDecisions survive export → restore (restart persistence)', () => {
   assert.deepEqual(am2.exportShadowDecisions(), snap);
   assert.equal(am2.getStatus().shadowDecisions.total, 2);
 });
+
+// RF-3: when the half-open probe slot is held, getActiveAccount recurses with
+// the account excluded. Observation must happen exactly once per external call
+// — not again on the recursive hop.
+test('probe-held recursion records exactly one shadow decision', () => {
+  const am = new AccountManager([
+    api('probe', { priority: 0, port: 9 }),
+    api('fallback', { priority: 1, port: 9 }),
+  ], 0.98, { routingPolicy: { mode: 'shadow' } });
+  // Half-open on the preferred account so it is selected first.
+  am.accounts[0].circuitOpenUntil = Date.now() - 1;
+  am.accounts[0].consecutiveFailures = 1;
+
+  // Simulate the TOCTOU race: another request already claimed between select
+  // and acquire. Force the first acquire to fail so we recurse once.
+  const realAcquire = am._acquireCircuitProbe.bind(am);
+  let acquires = 0;
+  am._acquireCircuitProbe = (account) => {
+    acquires += 1;
+    if (acquires === 1) return false;
+    return realAcquire(account);
+  };
+
+  const chosen = am.getActiveAccount(null, 'claude-sonnet-5');
+  assert.equal(chosen.name, 'fallback');
+  assert.equal(am._shadowDecisions.total, 1,
+    'probe-held recursion must not double-count shadow evidence');
+});
