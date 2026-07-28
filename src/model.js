@@ -240,3 +240,28 @@ export function parseAdvisorModel(body) {
     return new AdvisorModelFinder().push(buf);
   } catch { return null; }
 }
+
+// Drop tools[].model on every advisor entry, keeping the tool itself. Used by
+// the strip-and-degrade path: the executor turn must keep flowing, but a blocked
+// or untranslatable advisor id must never egress. A bare advisor tool without
+// `model` is the ruled degrade (G9) — do NOT delete the whole tool entry here;
+// upstream then fails only the auxiliary channel (same outcome as the unpinned
+// executor-only degrade in AccountManager.getActiveAccount).
+export function stripAdvisorModelField(body) {
+  if (!body) return body;
+  try {
+    const buf = Buffer.isBuffer(body) ? body : Buffer.from(String(body), 'utf8');
+    if (!buf.includes('advisor')) return body;
+    const obj = JSON.parse(buf.toString('utf8'));
+    if (!Array.isArray(obj.tools)) return body;
+    let changed = false;
+    for (const t of obj.tools) {
+      if (t && typeof t === 'object' && typeof t.type === 'string'
+          && /^advisor/i.test(t.type) && Object.prototype.hasOwnProperty.call(t, 'model')) {
+        delete t.model;
+        changed = true;
+      }
+    }
+    return changed ? Buffer.from(JSON.stringify(obj), 'utf8') : body;
+  } catch { return body; }
+}

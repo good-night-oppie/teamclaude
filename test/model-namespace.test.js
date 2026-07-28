@@ -8,6 +8,9 @@ import {
   normalizeRoutes,
   normalizeAccounts,
   accountAllows,
+  accountAcceptsModel,
+  accountAcceptsAllIds,
+  requestModelIds,
   pinnedRoutabilityOf,
   resolveAccountToken,
   CLAUDE_CODE_GATE_MODELED_VERSION,
@@ -392,6 +395,59 @@ test('accountAllows agrees with AccountManager._routeAllows for every model x ac
     for (const account of am2.accounts) {
       assert.equal(accountAllows(routes2, am2.accounts, account, model), am2._routeAllows(account, model),
         `divergence on ${account.name} x ${model}`);
+    }
+  }
+});
+
+test('accountAcceptsModel agrees with AccountManager._acceptsModel for every model x account', () => {
+  const config = liveConfig();
+  // Arm the closed-adapter contract the live fleet currently leaves inert.
+  config.accounts[5].strictModelMap = true;
+  config.accounts[5].acceptsModels = ['deepseek-v4-pro'];
+  config.accounts[6].strictModelMap = true;
+  config.accounts[6].acceptsModels = ['deepseek-v4-flash'];
+  const am = new AccountManager(config.accounts, 0.98, { routes: config.routes });
+  const models = [
+    'claude-fable-5', 'claude-opus-4-8', 'claude-sonnet-5', 'kimi-k3',
+    'deepseek-v4-pro', 'something-nobody-maps',
+  ];
+  let checked = 0;
+  for (const model of models) {
+    for (const account of am.accounts) {
+      assert.equal(
+        accountAcceptsModel(account, model),
+        am._acceptsModel(account, model),
+        `accepts divergence on ${account.name} x ${model}`);
+      checked++;
+    }
+  }
+  assert.equal(checked, models.length * config.accounts.length);
+});
+
+test('requestModelIds + accountAcceptsAllIds pins set-quantified gates to selection', () => {
+  const account = {
+    name: 'closed', strictModelMap: true, acceptsModels: ['exec-native'],
+    modelMap: { 'claude-opus-4-8': 'exec-native', 'claude-sonnet-5': 'exec-native' },
+  };
+  const am = new AccountManager([{
+    ...account, type: 'apikey', apiKey: 'k', upstream: 'http://127.0.0.1:9',
+  }], 0.98);
+  const a = am.accounts[0];
+  const pairs = [
+    ['claude-opus-4-8', null],
+    ['claude-opus-4-8', 'claude-sonnet-5'],
+    ['claude-opus-4-8', 'claude-fable-5'],
+    ['claude-fable-5', 'claude-opus-4-8'],
+  ];
+  for (const [model, advisorModel] of pairs) {
+    const ids = requestModelIds({ model, advisorModel });
+    const setOk = accountAcceptsAllIds(a, ids);
+    const selectOk = am._acceptsModel(a, model) && (!advisorModel || am._acceptsModel(a, advisorModel));
+    assert.equal(setOk, selectOk, `set vs selection on ${model}+${advisorModel}`);
+    // _isAvailable's advisor branch is exactly the set conjunction for capability.
+    if (advisorModel) {
+      assert.equal(am._isAvailable(a, model, advisorModel), setOk
+        && am._isAvailable(a, model, null)); // quota/route may still exclude
     }
   }
 });
