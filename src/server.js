@@ -685,6 +685,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // Refresh OAuth token if needed
   await accountManager.ensureTokenFresh(account.index);
   if (account.status === 'error' && retryCount < maxRetries) {
+    accountManager.releaseCircuitProbe(account.index);
     ctx.tried.add(account.index);
     return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
   }
@@ -762,7 +763,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // only until the response headers arrive — long enough to stagger the burst,
     // then released so streaming bodies don't tie up concurrency. Fail-open: a
     // client that disconnects while waiting just drops out.
-    if (!await accountManager.admit(account.index, () => res.destroyed)) return;
+    if (!await accountManager.admit(account.index, () => res.destroyed)) {
+      accountManager.releaseCircuitProbe(account.index);
+      return;
+    }
     let upstreamRes;
     const attemptStartedAt = Date.now();
     try {
