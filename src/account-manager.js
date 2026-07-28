@@ -98,6 +98,9 @@ function makeAccount(acct, index) {
     // by design — restarting the supervised adapter/data plane is a clean probe.
     consecutiveFailures: 0,
     circuitOpenUntil: null,
+    // Half-open single-flight: at most one live request may probe an expired
+    // circuit. Availability checks read this flag but never set it.
+    circuitProbeInFlight: false,
     latencyEwmaMs: null,
     lastFailure: null,
     lastSuccessAt: null,
@@ -296,20 +299,28 @@ export class AccountManager {
     // without requiring that separate feature to be enabled.
     const sessionAware = !!sessionId && (this.distributeSessions
       || (this.routingPolicy.mode === 'dynamic' && this.routingPolicy.preserveSessionAffinity));
+    let account = null;
     if (sessionAware && !this._pinnedAccountForModel(model, advisorModel)) {
-      const acc = this._selectForSession(sessionId, exclude, model, advisorModel);
-      if (acc) return acc;
+      account = this._selectForSession(sessionId, exclude, model, advisorModel);
     }
-    if (advisorModel) {
-      const account = this._select(exclude, model, advisorModel, false);
-      if (account) return account;
-      // Throttled so a busy advisor session doesn't flood the activity log.
-      if (Date.now() >= (this._advisorDegradeLogAt || 0)) {
-        this._advisorDegradeLogAt = Date.now() + 60_000;
-        console.log(`[TeamClaude] No account eligible for advisor model "${advisorModel}" — routing by request model only`);
+    if (!account && advisorModel) {
+      account = this._select(exclude, model, advisorModel, false);
+      if (!account) {
+        // Throttled so a busy advisor session doesn't flood the activity log.
+        if (Date.now() >= (this._advisorDegradeLogAt || 0)) {
+          this._advisorDegradeLogAt = Date.now() + 60_000;
+          console.log(`[TeamClaude] No account eligible for advisor model "${advisorModel}" — routing by request model only`);
+        }
       }
     }
-    return this._select(exclude, model, null, true);
+    if (!account) account = this._select(exclude, model, null, true);
+    if (!account) return null;
+    // Request-path state transition: claim the half-open probe slot (if any)
+    // before any await. Status/TUI reads never reach here.
+    if (this._acquireCircuitProbe(account)) return account;
+    const nextExclude = exclude instanceof Set ? new Set(exclude) : new Set();
+    nextExclude.add(account.index);
+    return this.getActiveAccount(nextExclude, model, advisorModel, sessionId);
   }
 
   /** Record a strip-and-degrade for an advisor id (blocked / pin-unservable /
@@ -699,12 +710,13 @@ export class AccountManager {
     // Custom-adapter circuit breaker. A real Anthropic OAuth account has no
     // local adapter boundary, so transport errors there keep the established
     // client-retry semantics rather than being mistaken for account health.
-    if (account.upstream && account.circuitOpenUntil) {
-      if (Date.now() < account.circuitOpenUntil) return false;
-      // Half-open: let one real request test it. Selection/ramp prevents a herd;
-      // success closes, failure reopens with exponential backoff.
-      account.circuitOpenUntil = null;
+    // PURE with respect to breaker state: an expired circuit is half-open
+    // eligible, but this filter never clears circuitOpenUntil or claims the
+    // probe slot — GET /teamclaude/status and TUI renders must not close circuits.
+    if (account.upstream && account.circuitOpenUntil && Date.now() < account.circuitOpenUntil) {
+      return false;
     }
+    if (account.upstream && account.circuitProbeInFlight) return false;
     // Model-scoped: _isNearQuota checks the shared 5h bucket plus only the weekly
     // bucket that governs this model, so a spent Fable/Sonnet bucket bars just
     // that family — the account still serves every other model normally.
@@ -735,6 +747,28 @@ export class AccountManager {
     }
 
     return true;
+  }
+
+  /** Claim the half-open probe slot for a live request. Pure availability may
+   * report an expired circuit as eligible; exactly one request may proceed to
+   * exercise it. Returns false when another probe is already in flight (or the
+   * circuit is still open). No-op (returns true) when there is no circuit. */
+  _acquireCircuitProbe(account) {
+    if (!account?.upstream) return true;
+    if (account.circuitOpenUntil && Date.now() < account.circuitOpenUntil) return false;
+    if (account.circuitProbeInFlight) return false;
+    if (account.circuitOpenUntil && Date.now() >= account.circuitOpenUntil) {
+      account.circuitProbeInFlight = true;
+    }
+    return true;
+  }
+
+  /** Drop a half-open probe claim without recording a provider result — used when
+   * the request abandons the account before an upstream attempt (admit abort,
+   * pre-flight failover). noteProviderResult also clears the flag. */
+  releaseCircuitProbe(accountIndex) {
+    const a = this.accounts[accountIndex];
+    if (a) a.circuitProbeInFlight = false;
   }
 
   /** Whether a closed adapter can turn `model` into a model its upstream knows.
@@ -1344,6 +1378,7 @@ export class AccountManager {
   noteProviderResult(accountIndex, { ok, latencyMs = null, status = null, error = null } = {}) {
     const a = this.accounts[accountIndex];
     if (!a || !a.upstream) return 0;
+    a.circuitProbeInFlight = false;
     if (Number.isFinite(latencyMs) && latencyMs >= 0) {
       a.latencyEwmaMs = a.latencyEwmaMs == null ? latencyMs : (0.8 * a.latencyEwmaMs + 0.2 * latencyMs);
     }
