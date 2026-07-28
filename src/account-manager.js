@@ -176,6 +176,9 @@ export class AccountManager {
     this._dynamicCurrentByKey = new Map();
     this._dynamicEvalAtByKey = new Map();
     this._shadowDecisions = { total: 0, changed: 0, last: null };
+    // Count of advisor strip-and-degrade events (blocked / pin-unservable /
+    // unmapped). Visible on GET /teamclaude/status so the degrade is never silent.
+    this._advisorDegrades = 0;
     // Ephemeral per-route manual pins (routeName → account index). Not persisted:
     // like the global manual switch (currentIndex) these are runtime overrides that
     // bias selection for a route's models and reset on restart. A pinned account
@@ -320,6 +323,24 @@ export class AccountManager {
       }
     }
     return this._select(exclude, model, null, true);
+  }
+
+  /** Record a strip-and-degrade for an advisor id (blocked / pin-unservable /
+   * unmapped). Increments the visible counter and shares the unpinned degrade's
+   * once-a-minute log throttle so a busy session does not flood the activity log. */
+  noteAdvisorDegrade(reason, advisorModel, detail = null) {
+    this._advisorDegrades += 1;
+    if (Date.now() < (this._advisorDegradeLogAt || 0)) return;
+    this._advisorDegradeLogAt = Date.now() + 60_000;
+    if (reason === 'blocked') {
+      console.log(`[TeamClaude] Advisor model "${advisorModel}" blocked by "${detail}" — stripped; routing by request model only`);
+    } else if (reason === 'pin-unservable') {
+      console.log(`[TeamClaude] Pinned account "${detail}" cannot serve advisor model "${advisorModel}" — stripped; routing by request model only`);
+    } else if (reason === 'unmapped') {
+      console.log(`[TeamClaude] Advisor model "${advisorModel}" has no modelMap entry on "${detail}" — stripped; never egressing verbatim`);
+    } else {
+      console.log(`[TeamClaude] Advisor model "${advisorModel}" stripped (${reason}${detail ? `: ${detail}` : ''})`);
+    }
   }
 
   /** Stable key for no-session dynamic stickiness. Exact model ids are used on
@@ -1639,6 +1660,7 @@ export class AccountManager {
       switchThreshold: this.switchThreshold,
       routingPolicy: { ...this.routingPolicy },
       shadowDecisions: { ...this._shadowDecisions },
+      advisorDegrades: this._advisorDegrades,
       routes: this.getRoutes(),
       sessions: { ...sessions, distribute: this.distributeSessions },
       accounts: this.accounts.map(a => ({

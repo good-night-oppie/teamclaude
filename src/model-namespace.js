@@ -193,6 +193,49 @@ export function accountAcceptsModel(account, model) {
   return !accepted?.length || accepted.includes(String(model));
 }
 
+// ── request identifier set ───────────────────────────────────
+//
+// Every judgment about a request MUST consume the full id set. Today that set
+// is {executor model, advisorModel}; a future id source (e.g. fallbacks[].model)
+// means adding an extractor and joining HERE — never a fourth ad-hoc gate in
+// server.js. Selection (_isAvailable advisor branch) already quantifies over
+// the set; the request-path gates (blockedModels, /tc-acct capability,
+// rewriteModel) must use the same predicates so they cannot drift.
+
+/** The ordered, de-duplicated model ids a request carries. Empty strings and
+ * nulls are dropped; advisor duplicates the executor when they coincide. */
+export function requestModelIds({ model = null, advisorModel = null } = {}) {
+  const ids = [];
+  if (typeof model === 'string' && model) ids.push(model);
+  if (typeof advisorModel === 'string' && advisorModel && !ids.includes(advisorModel)) {
+    ids.push(advisorModel);
+  }
+  return ids;
+}
+
+/** First blockedModels hit across the id set, or null. Ids are walked in
+ * caller order (requestModelIds puts the executor first), so a dual hit
+ * reports the executor — which still 400s. An advisor-only hit is what
+ * strip-and-degrade consumes. `executor` names which id is the executor so
+ * the role field is unambiguous when the set is built differently. */
+export function blockedIdInSet(blockedModels, ids, { executor = null } = {}) {
+  if (!Array.isArray(blockedModels) || !Array.isArray(ids)) return null;
+  for (let i = 0; i < ids.length; i++) {
+    const id = ids[i];
+    const pattern = blockedBy(blockedModels, id);
+    if (!pattern) continue;
+    const role = (executor != null ? id === executor : i === 0) ? 'executor' : 'advisor';
+    return { id, pattern, role };
+  }
+  return null;
+}
+
+/** True iff every id in the set is accepted by the account (empty set → true). */
+export function accountAcceptsAllIds(account, ids) {
+  if (!Array.isArray(ids) || !ids.length) return true;
+  return ids.every(id => accountAcceptsModel(account, id));
+}
+
 /** Every `blockedModels` glob that rejects `model`, in config order. The proxy
  * only ever names the first (server.js uses `.find`), but a caller explaining a
  * config wants the whole set — a second pattern matching the same id is a fact

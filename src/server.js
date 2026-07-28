@@ -8,7 +8,8 @@ import { ensureCerts, createConnectHandler } from './mitm.js';
 import { patchAccountUuid } from './account-uuid-rewrite.js';
 import { sanitizeToolPairs } from './tool-pair-sanitize.js';
 import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
-import { TopLevelFieldFinder, modelGlobMatches } from './model.js';
+import { TopLevelFieldFinder, stripAdvisorModelField } from './model.js';
+import { requestModelIds, blockedIdInSet } from './model-namespace.js';
 import { BodyWriter } from './request-log.js';
 import { upstreamFetch } from './upstream-fetch.js';
 import { tunnelTls } from './sx.js';
@@ -336,38 +337,46 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
           if (found && !hideActivity) hooks.onRequestModel?.(reqId, { model: found });
         }
       }
-      const body = Buffer.concat(bodyChunks);
+      let body = Buffer.concat(bodyChunks);
 
       const model = modelFinder.done ? modelFinder.value : parseRequestModel(body);
       // An advisor request (Claude Code's advisor tool) carries a SECOND model
-      // nested in tools[]; the advisor sub-inference runs on the selected
-      // account, so selection must be eligible for it too (issue #98).
-      const advisorModel = parseAdvisorModel(body);
+      // nested in tools[]; every request-path gate quantifies over the full id
+      // set {model, advisorModel} — see requestModelIds in model-namespace.js.
+      let advisorModel = parseAdvisorModel(body);
 
-      // Model blocklist (issue #116): reject a request for a blocked model right
-      // here instead of forwarding it. A model no account can serve (e.g. Fable
-      // once it left base plans) otherwise gets rate-limited upstream and hangs
-      // the pipeline; a fast, non-retryable 400 lets the client move on. Read
-      // live from the shared config so the TUI editor takes effect immediately.
-      const blockedBy = model ? (config?.blockedModels || []).find((p) => modelGlobMatches(p, model)) : null;
-      if (blockedBy) {
+      // Model blocklist (issue #116): reject when the EXECUTOR id is blocked.
+      // An advisor-only hit strip-and-degrades (G9): never 400 the executor turn
+      // over the auxiliary channel, and never egress the blocked advisor id.
+      const blockHit = blockedIdInSet(config?.blockedModels, requestModelIds({ model, advisorModel }), { executor: model });
+      if (blockHit?.role === 'executor') {
         if (!res.headersSent) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: `Model "${model}" is blocked by teamclaude (matched "${blockedBy}").` } }));
+          res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: `Model "${model}" is blocked by teamclaude (matched "${blockHit.pattern}").` } }));
         }
         hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: '(blocked)', status: 400, model, sessionId });
         return;
       }
+      if (blockHit?.role === 'advisor' && advisorModel) {
+        body = stripAdvisorModelField(body);
+        accountManager.noteAdvisorDegrade('blocked', advisorModel, blockHit.pattern);
+        advisorModel = null;
+      }
       // A /tc-acct pin intentionally bypasses route/quota/disabled selection,
       // but a closed adapter's finite model contract is not a preference. Reject
-      // locally rather than knowingly forwarding an untranslated id into the
-      // same non-retryable 400 that pins were being used to debug.
+      // locally when the EXECUTOR is unservable. An advisor-only miss
+      // strip-and-degrades (G9) so the pin still serves the executor turn.
       const pinnedAccount = pinnedIndex != null ? accountManager.accounts[pinnedIndex] : null;
       if (pinnedAccount && model && !accountManager._acceptsModel(pinnedAccount, model)) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: `Pinned account "${pinnedAccount.name}" cannot translate model "${model}" to an accepted provider model.` } }));
         hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: pinnedAccount.name, status: 400, model, sessionId });
         return;
+      }
+      if (pinnedAccount && advisorModel && !accountManager._acceptsModel(pinnedAccount, advisorModel)) {
+        body = stripAdvisorModelField(body);
+        accountManager.noteAdvisorDegrade('pin-unservable', advisorModel, pinnedAccount.name);
+        advisorModel = null;
       }
 
       const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, holdBudgetMs: holdMs, sessionId };
@@ -714,11 +723,21 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // token we're injecting (same-length patch; no-op if absent).
   if (account.accountUuid) sendBody = patchAccountUuid(sendBody, account.accountUuid);
   // Rewrite the model name for accounts that target a different upstream (e.g.
-  // GLM), which uses different model identifiers than Anthropic.
-  if (account.modelMap) sendBody = rewriteModel(sendBody, account.modelMap);
-  // If the body changed length (sanitize or model rewrite), update Content-Length
-  // so the upstream doesn't receive a mismatched framing and truncate or stall.
-  if (sendBody !== body) headers['content-length'] = String(sendBody.length);
+  // GLM), which uses different model identifiers than Anthropic. Advisor
+  // tools[].model walks the same map; on a custom upstream an unmapped advisor
+  // id is stripped (never egressed verbatim) — G9 strip-and-degrade.
+  if (account.modelMap) {
+    sendBody = rewriteModel(sendBody, account.modelMap, {
+      stripUnmappedAdvisor: !!account.upstream,
+      onAdvisorStrip: (id) => accountManager.noteAdvisorDegrade('unmapped', id, account.name),
+    });
+  }
+  // Content-Length must match the bytes we actually send. Gate-time advisor
+  // strip, sanitize, uuid patch, and model rewrite can all change the length
+  // relative to the client's original header — always recompute from sendBody.
+  if (!['GET', 'HEAD'].includes(method)) {
+    headers['content-length'] = String(sendBody.length);
+  }
 
   // Streaming request log, opened lazily on the first terminal outcome (a
   // pure-429-then-retry attempt writes no file, matching prior behavior). The
@@ -1149,17 +1168,40 @@ function extractUsageFromBody(buffer, accountIndex, accountManager) {
   }
 }
 
-// Rewrite the `model` field in a JSON request body using a per-account map.
-// Returns the original buffer unchanged if the model isn't in the map or the
-// body isn't valid JSON, so non-messages endpoints pass through safely.
+// Rewrite model ids in a JSON request body using a per-account map. Walks both
+// the executor `model` and any advisor tools[].model. Returns the original
+// buffer when nothing changes (or the body isn't JSON). When
+// `stripUnmappedAdvisor` is set, an advisor id absent from the map has its
+// `model` field dropped rather than egressing verbatim — the Content-Length
+// update at the write site already handles the size change.
 // Exported for tests.
-export function rewriteModel(body, modelMap) {
+export function rewriteModel(body, modelMap, {
+  stripUnmappedAdvisor = false,
+  onAdvisorStrip = null,
+} = {}) {
   try {
     const obj = JSON.parse(body.toString('utf8'));
+    let changed = false;
     if (obj.model && modelMap[obj.model]) {
       obj.model = modelMap[obj.model];
-      return Buffer.from(JSON.stringify(obj), 'utf8');
+      changed = true;
     }
+    if (Array.isArray(obj.tools)) {
+      for (const t of obj.tools) {
+        if (!t || typeof t !== 'object' || typeof t.type !== 'string' || !/^advisor/i.test(t.type)) continue;
+        if (typeof t.model !== 'string' || !t.model) continue;
+        if (modelMap[t.model]) {
+          t.model = modelMap[t.model];
+          changed = true;
+        } else if (stripUnmappedAdvisor) {
+          const stripped = t.model;
+          delete t.model;
+          changed = true;
+          onAdvisorStrip?.(stripped);
+        }
+      }
+    }
+    if (changed) return Buffer.from(JSON.stringify(obj), 'utf8');
   } catch { /* not JSON — pass through unchanged */ }
   return body;
 }
