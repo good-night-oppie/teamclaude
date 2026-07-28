@@ -21,6 +21,7 @@ import './model-preflight.js';
 registerBuildFeature('audit-b1-b6');
 registerBuildFeature('ingress-collision-gate');
 registerBuildFeature('serveable-availability');
+registerBuildFeature('quota-admission-gate');
 
 
 export const HOP_BY_HOP_HEADERS = new Set([
@@ -435,6 +436,55 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         advisorModel = null;
       }
 
+      // T4 admission gate — typed quota errors, never 200-with-refusal.
+      // Honest boundary: teamclaude can guarantee the TYPED-ERROR property only
+      // for exhaustion it KNOWS about (its own quota/circuit/disabled/token
+      // model, pre-egress). Rewriting an upstream's 200-with-refusal without
+      // body-sniffing stays REJECTED (fragile; see wf_91df8b75 research).
+      // When every account is known-unserveable for the EXECUTOR id for a
+      // capacity reason, refuse here — never forward (that forward is where
+      // 200-with-refusal enters and grades COMPLETED/EFFECT_UNKNOWN). Advisor
+      // unavailability alone still degrades at selection time and must not trip
+      // this gate. Config-only misses (all not-accepted / route-excluded) keep
+      // the legacy null-selection 429 shape. Pins keep their dedicated path.
+      if (pinnedIndex == null && accountManager.accounts.length
+          && !accountManager.accounts.some(a => accountManager._isAvailable(a, model, null))) {
+        const CAPACITY = new Set([
+          'quota-exhausted', 'circuit-open', 'probe-held', 'disabled', 'token-expired',
+        ]);
+        const reasons = accountManager.accounts.map(a => ({
+          name: a.name,
+          reason: accountManager._unavailableReason(a, model) || 'unavailable',
+        }));
+        if (reasons.some(r => CAPACITY.has(r.reason))) {
+          const snap = accountManager.getServeable(model);
+          let retryAfter = 60;
+          if (snap.soonestResetAt) {
+            const secs = Math.ceil((Date.parse(snap.soonestResetAt) - Date.now()) / 1000);
+            if (Number.isFinite(secs)) retryAfter = Math.max(1, secs);
+          }
+          retryAfter = Math.min(3600, retryAfter);
+          const detail = reasons.map(r => `${r.name}: ${r.reason}`).join('; ');
+          const message = `No serveable account for "${model || '<default>'}" (${detail}). Retry in ${retryAfter}s.`;
+          if (!res.headersSent) {
+            res.writeHead(429, {
+              'Content-Type': 'application/json',
+              'retry-after': String(retryAfter),
+            });
+            res.end(JSON.stringify({
+              type: 'error',
+              error: { type: 'rate_limit_error', message },
+            }));
+          }
+          hooks.onRequestEnd?.(reqId, {
+            method: req.method, path: req.url, account: '(none available)',
+            status: 429, model, sessionId,
+          });
+          return;
+        }
+      }
+
+      // reauthed: upstream #136 401-retry bound (one forced refresh per account per request)
       const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, holdBudgetMs: holdMs, sessionId };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and

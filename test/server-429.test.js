@@ -194,7 +194,11 @@ test('a quota-rejection 429 rotates to the next account', async () => {
   }
 });
 
-test('temporarily exhausted fleet waits and retries instead of surfacing synthetic 429', async () => {
+// Pre-T4: a 1s rate-limit hold was absorbed inline (wait + retry) so the client
+// never saw a synthetic 429. T4 surfaces known unserveability as a typed 429
+// with retry-after — never forward, never sleep the connection on a hold the
+// dispatch machine can grade itself.
+test('rate-limited fleet surfaces typed 429 with retry-after (no inline absorb)', async () => {
   let upstreamHits = 0;
   const upstream = http.createServer((_req, res) => {
     upstreamHits++;
@@ -216,34 +220,36 @@ test('temporarily exhausted fleet waits and retries instead of surfacing synthet
   const proxyPort = await listen(proxy);
 
   try {
-    const started = Date.now();
     const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ model: 'x', messages: [] }),
     });
     const text = await res.text();
-
-    assert.equal(res.status, 200, text);
-    assert.equal(upstreamHits, 1, 'request should reach upstream after throttle expires');
-    assert.ok(Date.now() - started >= 900, 'request should wait for retry window');
+    assert.equal(res.status, 429, text);
+    assert.equal(upstreamHits, 0, 'must not forward a known-held account');
+    const retryAfter = Number(res.headers.get('retry-after'));
+    assert.ok(retryAfter >= 1 && retryAfter <= 5, `retry-after ~1s, got ${retryAfter}`);
+    const body = JSON.parse(text);
+    assert.equal(body.type, 'error');
+    assert.equal(body.error?.type, 'rate_limit_error');
   } finally {
     proxy.close();
     upstream.close();
   }
 });
 
-// Regression for #46: a stale/poisoned cached quota (e.g. 0.98 from before a
-// plan upgrade, with a reset still in the future) must NOT pin the proxy in a
-// permanent synthetic 429. The next request should probe upstream, succeed, and
-// refresh the cached quota — rather than refusing locally without any call.
-test('stale over-threshold quota is re-probed, not refused forever', async () => {
+// Pre-T4 (#46): a stale/poisoned cached quota was re-probed on the request path
+// so a plan-upgrade snapshot could not pin the proxy in synthetic 429s forever.
+// T4 retires that probe for known near-quota state — forwarding is where
+// 200-with-refusal enters. Recovery is out-of-band (background Prober,
+// GET /teamclaude/serveable, operator reload), not a request-path gamble.
+test('stale over-threshold quota is typed-429 locally, not re-probed on the request path', async () => {
   let upstreamHits = 0;
   const upstream = http.createServer((_req, res) => {
     upstreamHits++;
     res.writeHead(200, {
       'content-type': 'application/json',
-      // Real headroom: the upgraded account is nowhere near its limit.
       'anthropic-ratelimit-unified-7d-utilization': '0.10',
     });
     res.end(JSON.stringify({ type: 'message', role: 'assistant', content: [] }));
@@ -254,7 +260,6 @@ test('stale over-threshold quota is re-probed, not refused forever', async () =>
     [{ name: 'a', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 }],
     0.98,
   );
-  // Simulate restoring a poisoned snapshot from teamclaude.state.json.
   am.restoreQuotaState([
     { name: 'a', quota: { unified7d: 0.98, unified7dReset: Date.now() + 7 * 24 * 3600_000 } },
   ]);
@@ -271,10 +276,14 @@ test('stale over-threshold quota is re-probed, not refused forever', async () =>
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ model: 'x', messages: [] }),
     });
-    await res.text();
-    assert.equal(res.status, 200, 'request should be proxied, not refused with a synthetic 429');
-    assert.equal(upstreamHits, 1, 'a real upstream probe should have been made');
-    assert.equal(am.accounts[0].quota.unified7d, 0.10, 'cached quota should be refreshed from the probe');
+    const text = await res.text();
+    assert.equal(res.status, 429, text);
+    assert.equal(upstreamHits, 0, 'known near-quota must not probe upstream');
+    assert.equal(am.accounts[0].quota.unified7d, 0.98, 'cached quota unchanged without a probe');
+    const body = JSON.parse(text);
+    assert.equal(body.type, 'error');
+    assert.equal(body.error?.type, 'rate_limit_error');
+    assert.match(body.error.message, /quota-exhausted/);
   } finally {
     proxy.close();
     upstream.close();
