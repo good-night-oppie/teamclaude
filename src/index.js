@@ -212,14 +212,18 @@ async function serverCommand() {
     return null;
   });
   if (savedState?.quota) accountManager.restoreQuotaState(savedState.quota);
+  if (savedState?.shadowDecisions) accountManager.restoreShadowDecisions(savedState.shadowDecisions);
 
   // With quota restored, pick the best account up front (highest priority /
   // soonest-resetting weekly window) instead of defaulting to the first one.
   accountManager.selectActiveAccount();
 
-  // Periodically persist quota (and once more on shutdown) to the state file.
+  // Periodically persist quota + shadow evidence (and once more on shutdown).
   const persistQuotaState = () =>
-    saveState({ quota: accountManager.exportQuotaState() })
+    saveState({
+      quota: accountManager.exportQuotaState(),
+      shadowDecisions: accountManager.exportShadowDecisions(),
+    })
       .catch(err => console.error(`[TeamClaude] Failed to save quota state: ${err.message}`));
   let quotaSaveInterval = null;
 

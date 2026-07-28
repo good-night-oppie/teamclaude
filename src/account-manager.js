@@ -315,6 +315,11 @@ export class AccountManager {
     }
     if (!account) account = this._select(exclude, model, null, true);
     if (!account) return null;
+    // Shadow evidence is per REQUEST decision (not reevaluate ticks), and must
+    // cover the session path Claude Code actually uses.
+    if (this.routingPolicy.mode === 'shadow') {
+      this._observeShadowDecision(exclude, model, advisorModel);
+    }
     // Request-path state transition: claim the half-open probe slot (if any)
     // before any await. Status/TUI reads never reach here.
     if (this._acquireCircuitProbe(account)) return account;
@@ -449,11 +454,13 @@ export class AccountManager {
     if (pinIdx != null) {
       const pinned = this.accounts[pinIdx];
       if (pinned && this._isAvailable(pinned, model, advisorModel) && !exclude?.has(pinIdx)) {
-        // Dynamic/shadow mode preserves a healthy session home. Reset-time
-        // optimization applies when assigning new work, not by moving a live
-        // prompt cache every time another account's rank changes. Legacy mode
-        // keeps its historical priority preemption semantics.
-        if (this.routingPolicy.mode !== 'priority-first') return pinned;
+        // Dynamic mode preserves a healthy session home. Shadow must stay
+        // request-path NEUTRAL with distributeSessions:true — same priority
+        // preemption as priority-first — otherwise enabling shadow changes
+        // real routing. Reset-time optimization applies when assigning new
+        // work, not by moving a live prompt cache every time another account's
+        // rank changes.
+        if (this.routingPolicy.mode === 'dynamic') return pinned;
         const betterExists = this.accounts.some(a =>
           this._isAvailable(a, model, advisorModel) && !exclude?.has(a.index) && (a.priority || 0) < (pinned.priority || 0));
         if (!betterExists) return pinned;
@@ -478,7 +485,10 @@ export class AccountManager {
       if (inFlight) return inFlight;
       return a.index - b.index;
     };
-    if (this.routingPolicy.mode === 'priority-first') {
+    // Shadow serves the exact priority-first order (neutrality). Dynamic uses
+    // expiration-first. Shadow evidence is recorded once per request in
+    // getActiveAccount — not here — so session + no-session paths share one counter.
+    if (this.routingPolicy.mode === 'priority-first' || this.routingPolicy.mode === 'shadow') {
       return [...eligible].sort((a, b) => {
         const pa = a.priority || 0;
         const pb = b.priority || 0;
@@ -489,19 +499,10 @@ export class AccountManager {
           - (this._governingWeeklyReset(b, model) || -Infinity);
       })[0] || null;
     }
-    const legacy = [...eligible].sort((a, b) => {
-      const c = this._legacyCompare(a, b, model);
-      return c || compareLoad(a, b);
-    })[0] || null;
-    const dynamic = [...eligible].sort((a, b) => {
+    return [...eligible].sort((a, b) => {
       const c = this.dynamicCompare(a, b, model, now);
       return c || compareLoad(a, b);
     })[0] || null;
-    if (this.routingPolicy.mode === 'shadow') {
-      this._recordShadowDecision(legacy, dynamic, model);
-      return legacy;
-    }
-    return dynamic;
   }
 
   /** Record that a session's request was served by an account (always on, even
@@ -1209,10 +1210,23 @@ export class AccountManager {
     }
   }
 
+  /** Compare legacy vs dynamic winners for THIS request and record evidence.
+   * Called once from getActiveAccount so ticks, session affinity, and
+   * sticky-current paths all count the same way. */
+  _observeShadowDecision(exclude = null, model = null, advisorModel = null) {
+    const eligible = this.accounts.filter(account =>
+      !exclude?.has(account.index) && this._isAvailable(account, model, advisorModel));
+    if (!eligible.length) return;
+    const legacy = [...eligible].sort((a, b) => this._legacyCompare(a, b, model))[0];
+    const dynamic = [...eligible].sort((a, b) => this.dynamicCompare(a, b, model))[0];
+    this._recordShadowDecision(legacy, dynamic, model);
+  }
+
   /**
    * Pick the best available account by the configured policy, WITHOUT mutating
    * state. `priority-first` is byte-for-byte the old semantic order; `shadow`
-   * serves legacy and records disagreement; `dynamic` serves expiration-first.
+   * serves legacy (evidence is recorded in getActiveAccount); `dynamic` serves
+   * expiration-first.
    */
   _pickBestAvailable(exclude = null, model = null, advisorModel = null) {
     const eligible = this.accounts.filter(account =>
@@ -1220,13 +1234,21 @@ export class AccountManager {
     if (!eligible.length) return null;
 
     const legacy = [...eligible].sort((a, b) => this._legacyCompare(a, b, model))[0];
-    if (this.routingPolicy.mode === 'priority-first') return legacy;
-    const dynamic = [...eligible].sort((a, b) => this.dynamicCompare(a, b, model))[0];
-    if (this.routingPolicy.mode === 'shadow') {
-      this._recordShadowDecision(legacy, dynamic, model);
+    if (this.routingPolicy.mode === 'priority-first' || this.routingPolicy.mode === 'shadow') {
       return legacy;
     }
-    return dynamic;
+    return [...eligible].sort((a, b) => this.dynamicCompare(a, b, model))[0];
+  }
+
+  exportShadowDecisions() {
+    return { ...this._shadowDecisions };
+  }
+
+  restoreShadowDecisions(saved) {
+    if (!saved || typeof saved !== 'object') return;
+    this._shadowDecisions.total = Number.isFinite(saved.total) ? saved.total : 0;
+    this._shadowDecisions.changed = Number.isFinite(saved.changed) ? saved.changed : 0;
+    this._shadowDecisions.last = saved.last ?? null;
   }
 
   /**

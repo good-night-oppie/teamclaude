@@ -155,7 +155,7 @@ test('shadow mode records a disagreement but serves the legacy account', () => {
   ], 0.98, { routingPolicy: { mode: 'shadow' } });
   measured(am, 0, { r7: NOW + 96 * H });
   measured(am, 1, { r7: NOW + H });
-  assert.equal(am._pickBestAvailable(null, 'claude-opus-4-8').name, 'legacy');
+  assert.equal(am.getActiveAccount(null, 'claude-opus-4-8').name, 'legacy');
   assert.equal(am._shadowDecisions.total, 1);
   assert.equal(am._shadowDecisions.changed, 1);
   assert.match(am._shadowDecisions.last, /legacy->dynamic/);
@@ -364,4 +364,61 @@ test('no-session dynamic stickiness is per model; Fable cannot overwrite Opus ho
   assert.equal(am.currentIndex, 1, 'last-served marker follows Fable');
   assert.equal(am.getActiveAccount(null, 'claude-opus-4-8').name, 'a',
     'Opus uses its own cached dynamic home, not global currentIndex');
+});
+
+// ── B5: shadow neutrality + evidential counters ────────────────────────────
+
+test('shadow+distributeSessions is request-path neutral vs priority-first', () => {
+  const mk = (mode) => {
+    const am = new AccountManager([
+      oauth('high', { priority: 0 }), oauth('low', { priority: 20 }),
+    ], 0.98, { distributeSessions: true, routingPolicy: { mode } });
+    measured(am, 0, { r7: NOW + 96 * H });
+    measured(am, 1, { r7: NOW + H });
+    // Session pinned to the lower-priority account — priority-first preempts;
+    // a non-neutral shadow would keep the pin (dynamic affinity).
+    am.recordSession('s1', 1);
+    return am.getActiveAccount(null, 'claude-opus-4-8', null, 's1').name;
+  };
+  assert.equal(mk('priority-first'), 'high');
+  assert.equal(mk('shadow'), 'high', 'shadow must not change routing when distributeSessions is on');
+  assert.equal(mk('dynamic'), 'low', 'dynamic keeps the session home');
+});
+
+test('shadowDecisions counts per request, including the session path', () => {
+  const am = new AccountManager([
+    oauth('legacy', { priority: 0 }), oauth('dynamic', { priority: 20 }),
+  ], 0.98, {
+    distributeSessions: true,
+    routingPolicy: { mode: 'shadow', reevaluateMs: 60 * 60 * 1000 }, // long tick
+  });
+  measured(am, 0, { r7: NOW + 96 * H });
+  measured(am, 1, { r7: NOW + H });
+  am.recordSession('s', 0);
+  for (let i = 0; i < 10; i++) {
+    assert.equal(am.getActiveAccount(null, 'claude-opus-4-8', null, 's').name, 'legacy');
+  }
+  assert.equal(am._shadowDecisions.total, 10,
+    '1000 requests must not collapse to total=1 via reevaluate ticks');
+  assert.equal(am._shadowDecisions.changed, 10, 'session path must observe dynamic disagreement');
+});
+
+test('shadowDecisions survive export → restore (restart persistence)', () => {
+  const am1 = new AccountManager([
+    oauth('legacy', { priority: 0 }), oauth('dynamic', { priority: 20 }),
+  ], 0.98, { routingPolicy: { mode: 'shadow' } });
+  measured(am1, 0, { r7: NOW + 96 * H });
+  measured(am1, 1, { r7: NOW + H });
+  am1.getActiveAccount(null, 'claude-opus-4-8');
+  am1.getActiveAccount(null, 'claude-opus-4-8');
+  const snap = am1.exportShadowDecisions();
+  assert.equal(snap.total, 2);
+  assert.equal(snap.changed, 2);
+
+  const am2 = new AccountManager([
+    oauth('legacy', { priority: 0 }), oauth('dynamic', { priority: 20 }),
+  ], 0.98, { routingPolicy: { mode: 'shadow' } });
+  am2.restoreShadowDecisions(snap);
+  assert.deepEqual(am2.exportShadowDecisions(), snap);
+  assert.equal(am2.getStatus().shadowDecisions.total, 2);
 });
