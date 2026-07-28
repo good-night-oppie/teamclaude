@@ -1804,6 +1804,7 @@ export class AccountManager {
 
   /** Update the runtime selection policy from disk. */
   setRoutingPolicy(policy = {}) {
+    const prevMode = this.routingPolicy?.mode;
     const mode = ['priority-first', 'shadow', 'dynamic'].includes(policy?.mode)
       ? policy.mode : 'priority-first';
     this.routingPolicy = {
@@ -1812,6 +1813,14 @@ export class AccountManager {
       reevaluateMs: Number.isFinite(policy?.reevaluateMs)
         ? Math.max(0, policy.reevaluateMs) : 5 * 60 * 1000,
     };
+    // Maps left from a prior dynamic window suppress the first honest re-eval
+    // after promotion (stale eval clock) and pin requests to a wrong index.
+    // Clear only on the transition INTO dynamic — same-mode reloads keep
+    // live stickiness; leaving dynamic makes the maps inert until next entry.
+    if (mode === 'dynamic' && prevMode !== 'dynamic') {
+      this._dynamicCurrentByKey.clear();
+      this._dynamicEvalAtByKey.clear();
+    }
     return this.routingPolicy;
   }
 

@@ -471,3 +471,20 @@ test('T9-1: removeAccount reindexes dynamic maps so stickiness still names the s
   assert.equal(am.getActiveAccount(null, model).name, 'b',
     'dynamic stickiness must follow B after the index shift, not land on C or undefined');
 });
+
+test('T9-2: promoting into dynamic clears stale eval clocks and current indices', () => {
+  const am = new AccountManager([
+    oauth('stale-home', { priority: 0 }), oauth('dynamic-best', { priority: 20 }),
+  ], 0.98, { routingPolicy: { mode: 'shadow', reevaluateMs: 300000 } });
+  measured(am, 0, { r7: NOW + 96 * H });
+  measured(am, 1, { r7: NOW + H });
+  const model = 'claude-opus-4-8';
+  const key = am._dynamicKey(model);
+  // Leftover from a prior dynamic window: recent eval clock + wrong index.
+  am._dynamicCurrentByKey.set(key, 0);
+  am._dynamicEvalAtByKey.set(key, Date.now());
+  am.currentIndex = 0;
+  am.setRoutingPolicy({ mode: 'dynamic', reevaluateMs: 300000 });
+  assert.equal(am.getActiveAccount(null, model).name, 'dynamic-best',
+    'first request after promotion must re-evaluate, not honor the stale index/clock');
+});
