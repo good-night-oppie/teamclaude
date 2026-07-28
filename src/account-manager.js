@@ -312,8 +312,12 @@ export class AccountManager {
    * bucket, so the account must be eligible for both models. When no account
    * satisfies both, selection degrades to executor-only routing so the main
    * request keeps flowing (upstream then fails just the advisor call).
+   *
+   * `_shadowObserved` is internal: when a half-open probe claim is held we
+   * recurse with the account excluded; the flag keeps shadow evidence at
+   * exactly one observation per external call.
    */
-  getActiveAccount(exclude = null, model = null, advisorModel = null, sessionId = null) {
+  getActiveAccount(exclude = null, model = null, advisorModel = null, sessionId = null, _shadowObserved = false) {
     // Clear expired quotas across all accounts and switch proactively if a
     // session reset made a sooner-expiring account the better choice. This runs
     // on every request so the behaviour holds without the TUI render loop.
@@ -342,16 +346,18 @@ export class AccountManager {
     if (!account) account = this._select(exclude, model, null, true);
     if (!account) return null;
     // Shadow evidence is per REQUEST decision (not reevaluate ticks), and must
-    // cover the session path Claude Code actually uses.
-    if (this.routingPolicy.mode === 'shadow') {
+    // cover the session path Claude Code actually uses. Observe once per
+    // external call — probe-held recursion must not double-count.
+    if (this.routingPolicy.mode === 'shadow' && !_shadowObserved) {
       this._observeShadowDecision(exclude, model, advisorModel);
+      _shadowObserved = true;
     }
     // Request-path state transition: claim the half-open probe slot (if any)
     // before any await. Status/TUI reads never reach here.
     if (this._acquireCircuitProbe(account)) return account;
     const nextExclude = exclude instanceof Set ? new Set(exclude) : new Set();
     nextExclude.add(account.index);
-    return this.getActiveAccount(nextExclude, model, advisorModel, sessionId);
+    return this.getActiveAccount(nextExclude, model, advisorModel, sessionId, _shadowObserved);
   }
 
   /** Record a strip-and-degrade for an advisor id (blocked / pin-unservable /
