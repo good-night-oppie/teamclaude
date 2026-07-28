@@ -734,13 +734,12 @@ export class AccountManager {
     // Manually disabled accounts are skipped entirely until re-enabled.
     if (account.disabled) return false;
 
-    // Check rate limit expiry
-    if (account.status === 'throttled' && account.rateLimitedUntil) {
-      if (Date.now() < account.rateLimitedUntil) return false;
-      account.status = 'active';
-      account.rateLimitedUntil = null;
-      account.throttledAt = null;
-      console.log(`[TeamClaude] Account "${account.name}" rate limit expired, marking active`);
+    // Rate-limit hold: PURE — an expired hold is treated as available without
+    // clearing. refreshExpiredQuotas (request path) clears the stamp; status /
+    // serveable / TUI reads must not mutate.
+    if (account.status === 'throttled' && account.rateLimitedUntil
+        && Date.now() < account.rateLimitedUntil) {
+      return false;
     }
 
     if (account.status === 'exhausted' || account.status === 'error') return false;
@@ -786,6 +785,118 @@ export class AccountManager {
     }
 
     return true;
+  }
+
+  /**
+   * Compact machine reason why `account` is not serveable for `model`.
+   * Closed enum derived from the same state `_isAvailable` reads — no new
+   * bookkeeping. Returns null when the account is serveable.
+   *   quota-exhausted | circuit-open | probe-held | disabled |
+   *   token-expired | route-excluded | not-accepted
+   */
+  _unavailableReason(account, model = null, advisorModel = null) {
+    if (!account) return 'disabled';
+    if (account.disabled) return 'disabled';
+    if (account.status === 'throttled' && account.rateLimitedUntil
+        && Date.now() < account.rateLimitedUntil) {
+      return 'quota-exhausted';
+    }
+    if (account.status === 'exhausted') return 'quota-exhausted';
+    if (account.status === 'error') return 'token-expired';
+    if (account.upstream && account.circuitOpenUntil && Date.now() < account.circuitOpenUntil) {
+      return 'circuit-open';
+    }
+    if (account.upstream && circuitProbeClaimFresh(account)) return 'probe-held';
+    if (this._isNearQuota(account, model)) return 'quota-exhausted';
+    if (model && !this._routeAllows(account, model)) return 'route-excluded';
+    if (model && !this._acceptsModel(account, model)) return 'not-accepted';
+    if (advisorModel) {
+      if (this._modelWeeklyExhausted(account, advisorModel)) return 'quota-exhausted';
+      if (!this._routeAllows(account, advisorModel)) return 'route-excluded';
+      if (!this._acceptsModel(account, advisorModel)) return 'not-accepted';
+    }
+    return null;
+  }
+
+  /**
+   * Soonest governing reset (ms) among the account's quota / throttle windows
+   * that apply to `model` (null = shared/general buckets only). null when none
+   * are known or all have already passed.
+   */
+  _soonestResetMs(account, model = null) {
+    if (!account) return null;
+    const now = Date.now();
+    const candidates = [];
+    if (account.rateLimitedUntil && account.rateLimitedUntil > now) {
+      candidates.push(account.rateLimitedUntil);
+    }
+    const q = account.quota;
+    if (q.unified5hReset && q.unified5hReset > now) candidates.push(q.unified5hReset);
+    const weeklyReset = this._governingWeeklyReset(account, model);
+    if (weeklyReset && weeklyReset > now) candidates.push(weeklyReset);
+    // When model is null (general status), also consider family-specific resets
+    // so the soonest fleet-visible window surfaces even without a model id.
+    if (!model) {
+      for (const key of ['unified7dReset', 'unified7dSonnetReset', 'unified7dFableReset']) {
+        if (q[key] && q[key] > now) candidates.push(q[key]);
+      }
+    }
+    if (q.resetsAt) {
+      const t = typeof q.resetsAt === 'number' ? q.resetsAt : new Date(q.resetsAt).getTime();
+      if (Number.isFinite(t) && t > now) candidates.push(t);
+    }
+    if (!candidates.length) return null;
+    return Math.min(...candidates);
+  }
+
+  /**
+   * ISO reset time for status/serveable, or null when unknown / not throttled.
+   * "Not throttled" means the account is not currently constrained by a
+   * rate-limit hold, exhausted status, or near-quota utilization.
+   */
+  _quotaResetAt(account, model = null) {
+    if (!account) return null;
+    const held = account.status === 'throttled' && account.rateLimitedUntil
+      && Date.now() < account.rateLimitedUntil;
+    const constrained = held || account.status === 'exhausted'
+      || this._isNearQuota(account, model);
+    if (!constrained) return null;
+    const ms = this._soonestResetMs(account, model);
+    return ms != null ? new Date(ms).toISOString() : null;
+  }
+
+  /**
+   * Model-scoped fleet availability for GET /teamclaude/serveable.
+   * Evaluates the executor id only (no request body → no advisor id). Callers
+   * that care about an advisor model must pass that id as `model` (or rely on
+   * ingress, which quantifies over the full id set). Read-only: reuses the
+   * pure `_isAvailable` path; never claims a probe slot or clears quota.
+   */
+  getServeable(model = null) {
+    const accounts = this.accounts.map(a => {
+      const serveableNow = this._isAvailable(a, model);
+      const row = {
+        name: a.name,
+        serveableNow,
+        quotaResetAt: this._quotaResetAt(a, model),
+      };
+      if (!serveableNow) {
+        const reason = this._unavailableReason(a, model);
+        if (reason) row.reason = reason;
+      }
+      return row;
+    });
+    let soonestMs = Infinity;
+    for (const a of this.accounts) {
+      const ms = this._soonestResetMs(a, model);
+      if (ms != null && ms < soonestMs) soonestMs = ms;
+    }
+    return {
+      model,
+      serveable: accounts.some(a => a.serveableNow),
+      accounts,
+      soonestResetAt: soonestMs === Infinity ? null : new Date(soonestMs).toISOString(),
+    };
   }
 
   /** Claim the half-open probe slot for a live request. Pure availability may
@@ -1081,6 +1192,20 @@ export class AccountManager {
     let changed = false;
     const sessionReset = [];
     for (const account of this.accounts) {
+      // Expired rate-limit holds used to clear inside _isAvailable; that made
+      // every status/TUI read a mutator. Clear them here on the request path.
+      // Skip disabled accounts — _isAvailable short-circuits before the hold
+      // check, so an operator-disabled account must keep its stamped hold
+      // (selection-hardening: soonest-reset must not resurrect it).
+      if (!account.disabled
+          && account.status === 'throttled' && account.rateLimitedUntil
+          && Date.now() >= account.rateLimitedUntil) {
+        account.status = 'active';
+        account.rateLimitedUntil = null;
+        account.throttledAt = null;
+        console.log(`[TeamClaude] Account "${account.name}" rate limit expired, marking active`);
+        changed = true;
+      }
       const r = this._clearExpiredQuotas(account);
       if (r.changed) changed = true;
       if (r.session) sessionReset.push(account);
@@ -1124,10 +1249,15 @@ export class AccountManager {
 
   _isNearQuota(account, model = null) {
     const q = account.quota;
-    this._clearExpiredQuotas(account);
+    const now = Date.now();
+    // PURE: treat an expired window as non-constraining without clearing.
+    // Clearing belongs on the request path via refreshExpiredQuotas — status /
+    // serveable reads must not wipe quota state (T3 purity / B3 continuation).
 
     // Shared 5-hour bucket gates every request regardless of model.
-    if (q.unified5h != null && q.unified5h >= this.switchThreshold) return true;
+    if (q.unified5h != null && q.unified5h >= this.switchThreshold) {
+      if (!q.unified5hReset || now < q.unified5hReset) return true;
+    }
 
     // Only the weekly bucket that GOVERNS this model is checked: Fable and Sonnet
     // meter their own weekly quota, so a spent Fable bucket must not bar an Opus
@@ -1135,17 +1265,24 @@ export class AccountManager {
     // (e.g. the plan doesn't expose it), fall back to the shared weekly so an
     // account over its overall cap is still treated as near-quota.
     const weeklyVal = this._governingWeekly(account, model);
-    if (weeklyVal != null && weeklyVal >= this.switchThreshold) return true;
+    if (weeklyVal != null && weeklyVal >= this.switchThreshold) {
+      const weeklyReset = this._governingWeeklyReset(account, model);
+      if (!weeklyReset || now < weeklyReset) return true;
+    }
 
     // Standard quotas (API key accounts)
     if (q.tokensLimit != null && q.tokensRemaining != null) {
       const used = 1 - (q.tokensRemaining / q.tokensLimit);
-      if (used >= this.switchThreshold) return true;
+      if (used >= this.switchThreshold) {
+        if (!q.resetsAt || now < new Date(q.resetsAt).getTime()) return true;
+      }
     }
 
     if (q.requestsLimit != null && q.requestsRemaining != null) {
       const used = 1 - (q.requestsRemaining / q.requestsLimit);
-      if (used >= this.switchThreshold) return true;
+      if (used >= this.switchThreshold) {
+        if (!q.resetsAt || now < new Date(q.resetsAt).getTime()) return true;
+      }
     }
 
     return false;
@@ -1758,6 +1895,11 @@ export class AccountManager {
         costTier: a.costTier,
         disabled: a.disabled || false,
         status: a.status,
+        // General (model=null) availability — weekly buckets are per-family, so
+        // this is NOT per-model truth. Callers that need model scope use
+        // GET /teamclaude/serveable?model=<id>.
+        serveableNow: this._isAvailable(a, null),
+        quotaResetAt: this._quotaResetAt(a, null),
         capability: {
           strictModelMap: a.strictModelMap,
           acceptsModels: a.acceptsModels ? [...a.acceptsModels] : null,

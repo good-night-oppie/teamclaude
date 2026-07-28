@@ -20,6 +20,7 @@ import './model-preflight.js';
 
 registerBuildFeature('audit-b1-b6');
 registerBuildFeature('ingress-collision-gate');
+registerBuildFeature('serveable-availability');
 
 
 export const HOP_BY_HOP_HEADERS = new Set([
@@ -96,6 +97,23 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
         const extra = hooks.getStatusExtra?.() || {};
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ...extra, ...status, build: buildIdentity() }, null, 2));
+        return;
+      }
+
+      // Model-scoped availability for fleet preflight (fugu-nano 3s gate).
+      // Executor id only — no body exists here; advisor-model callers pass the
+      // executor id (or the advisor id when that is the decision they need).
+      // Read-only: getServeable reuses pure _isAvailable (no breaker/probe/quota
+      // mutation).
+      if (req.method === 'GET' && (req.url === '/teamclaude/serveable'
+          || (req.url || '').startsWith('/teamclaude/serveable?'))) {
+        let model = null;
+        try {
+          model = new URL(req.url, 'http://localhost').searchParams.get('model');
+        } catch { /* malformed query → model stays null */ }
+        const body = accountManager.getServeable(model);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(body, null, 2));
         return;
       }
 
