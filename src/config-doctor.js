@@ -70,6 +70,7 @@ export function checkConfig(config, opts = {}) {
   checkModelMaps(config, routes, accounts, add);
   checkCapabilities(config, routes, accounts, opts.availableModels, add);
   checkDynamicPolicy(config, accounts, add);
+  checkRotationGate(config, add);
   checkAccountNamesAsModels(config, accounts, opts.availableModels, add);
   checkAllowlistDrift(config, opts, add);
 
@@ -324,6 +325,55 @@ function checkDynamicPolicy(config, accounts, add) {
       `routingPolicy.mode is "dynamic" but every account has the default costTier (0) and no route declares tiers[] — ranking has no economic boundary and reduces to soonest-reset-wins across the whole fleet.`,
       ['set costTier (or route tiers[]) so subscription and metered accounts do not share one unbounded tier',
         'run teamclaude rank <model> --json against the persisted quota snapshot before promoting further']);
+  }
+}
+
+// ── T2 rotation-gate declarations ──
+
+function checkRotationGate(config, add) {
+  // Prefer raw config accounts for declaration shape (normalizeAccounts drops
+  // historyFamily/acceptsHistoryFamilies).
+  const raw = Array.isArray(config?.accounts) ? config.accounts : [];
+  const rawAnyAccepts = raw.some(a => Array.isArray(a?.acceptsHistoryFamilies));
+  if (!rawAnyAccepts) return;
+
+  const emitted = new Set();
+  for (const a of raw) {
+    if (!a) continue;
+    const family = (a.historyFamily != null && String(a.historyFamily).length)
+      ? String(a.historyFamily)
+      : (a.upstream ? String(a.name || '') : 'anthropic');
+    if (family) emitted.add(family);
+  }
+
+  for (const a of raw) {
+    if (!a?.upstream) continue;
+    if (a.historyFamily != null && String(a.historyFamily).length) continue;
+    add('warn', 'history-family-unset', a.name,
+      `account "${a.name}" has a custom upstream and no historyFamily, while some account declares `
+      + `acceptsHistoryFamilies — the default (account name) over-fragments and may over-block rotation.`,
+      [`set historyFamily on "${a.name}" (e.g. shared "kimi" across kimi accounts)`,
+        'or remove acceptsHistoryFamilies declarations if the gate is not yet activated']);
+  }
+
+  for (const a of raw) {
+    if (!Array.isArray(a?.acceptsHistoryFamilies)) continue;
+    for (const fam of a.acceptsHistoryFamilies) {
+      const name = String(fam);
+      if (emitted.has(name)) continue;
+      add('error', 'unknown-family-in-acceptsHistoryFamilies', a.name,
+        `account "${a.name}" acceptsHistoryFamilies includes "${name}", but no account emits that `
+        + `historyFamily — the declaration can never match served evidence.`,
+        [`add an account with historyFamily "${name}", or remove "${name}" from acceptsHistoryFamilies`]);
+    }
+  }
+
+  if (emitted.size > 32) {
+    add('warn', 'history-families-over-32', 'rotationGate',
+      `${emitted.size} distinct historyFamily values exceed the 32-bit intern bound; the ledger `
+      + `fail-closes overflow families (over-blocks every declaring account) rather than aliasing bits.`,
+      ['merge equivalent custom-upstream accounts onto shared historyFamily names',
+        'the code-enforced fail-closed bound is the authority; this warn is advisory only']);
   }
 }
 

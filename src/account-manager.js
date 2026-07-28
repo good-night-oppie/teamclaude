@@ -4,6 +4,7 @@ import { weeklyBucketForModel, modelGlobMatches } from './model.js';
 import { SessionTracker } from './session-tracker.js';
 import { invalidateNormalizedConfigView } from './model-namespace.js';
 import { registerBuildFeature } from './build-identity.js';
+import { RotationLedger, resolveHistoryFamily } from './rotation-ledger.js';
 
 registerBuildFeature('dynamic-routing');
 
@@ -77,6 +78,13 @@ function makeAccount(acct, index) {
     // than forwarded verbatim into a non-retryable 400.
     acceptsModels: Array.isArray(acct.acceptsModels) ? acct.acceptsModels.map(String) : null,
     strictModelMap: !!acct.strictModelMap,
+    // T2 rotation gate: family this account EMITS into a transcript, and (opt-in)
+    // families its ingress contract ACCEPTS. Absent acceptsHistoryFamilies =
+    // tolerant/open (today's behavior). Defaults fail SAFE for custom upstreams
+    // (account name ⇒ over-fragment/over-block, never under-block).
+    historyFamily: resolveHistoryFamily(acct),
+    acceptsHistoryFamilies: Array.isArray(acct.acceptsHistoryFamilies)
+      ? acct.acceptsHistoryFamilies.map(String) : null,
     credential: acct.accessToken || acct.apiKey,
     refreshToken: acct.refreshToken || null,
     expiresAt: acct.expiresAt || null,
@@ -152,6 +160,8 @@ export class AccountManager {
     distributeSessions = false,
     sessionTracker,
     routingPolicy = {},
+    rotationGate = {},
+    rotationLedger = null,
   } = {}) {
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
@@ -160,6 +170,13 @@ export class AccountManager {
     this._refreshFn = refreshFn;
     this.accounts = accounts.map((acct, index) => makeAccount(acct, index));
     this.currentIndex = 0;
+    // T2: per-session served-family ledger. Own TTL (24h), NOT SessionTracker's
+    // 1h — poison outlives prompt cache. Default mode enforce is inert until
+    // some account declares acceptsHistoryFamilies.
+    const gateMode = ['enforce', 'shadow', 'off'].includes(rotationGate?.mode)
+      ? rotationGate.mode : 'enforce';
+    this.rotationGate = { mode: gateMode };
+    this.rotationLedger = rotationLedger || new RotationLedger();
     // Session awareness (issue #109). The tracker is always on (passive — it just
     // observes the x-claude-code-session-id header for the status readout).
     // `distributeSessions` gates the behavioural change: keep each session on its
@@ -321,11 +338,47 @@ export class AccountManager {
    * recurse with the account excluded; the flag keeps shadow evidence at
    * exactly one observation per external call.
    */
-  getActiveAccount(exclude = null, model = null, advisorModel = null, sessionId = null, _shadowObserved = false) {
+  getActiveAccount(exclude = null, model = null, advisorModel = null, sessionId = null, _shadowObserved = false, _gateObserved = false) {
     // Clear expired quotas across all accounts and switch proactively if a
     // session reset made a sooner-expiring account the better choice. This runs
     // on every request so the behaviour holds without the TUI render loop.
     this.refreshExpiredQuotas();
+
+    // T2 rotation gate — SINGLE CHOKE POINT. Union gate-blocked indices into a
+    // COPY of exclude (ctx.tried is passed by reference from server.js; mutating
+    // it would corrupt retry bookkeeping and probe-claim recursion). Pins
+    // (/tc-acct) never reach here. mode=off / no declarations ⇒ empty set
+    // (zero-config-inert routing).
+    const gateBlocked = (sessionId && this.rotationGate.mode !== 'off')
+      ? this.rotationLedger.incompatibleIndices(sessionId, this.accounts, this.rotationGate.mode)
+      : new Set();
+    const effectiveExclude = exclude instanceof Set ? new Set(exclude) : new Set();
+    if (gateBlocked.size && this.rotationGate.mode === 'enforce') {
+      for (const idx of gateBlocked) {
+        if (!effectiveExclude.has(idx)) {
+          effectiveExclude.add(idx);
+          const a = this.accounts[idx];
+          this.rotationLedger.noteBlockedSelection(
+            this.rotationLedger.familiesOf(sessionId), a?.name);
+        }
+      }
+    } else if (gateBlocked.size && this.rotationGate.mode === 'shadow' && !_gateObserved) {
+      // Observe would-block once per external call (probe recursion must not
+      // multiply counters).
+      _gateObserved = true;
+      for (const idx of gateBlocked) {
+        const a = this.accounts[idx];
+        this.rotationLedger.noteBlockedSelection(
+          this.rotationLedger.familiesOf(sessionId), a?.name);
+        if (Date.now() >= (this._rotationGateShadowLogAt || 0)) {
+          this._rotationGateShadowLogAt = Date.now() + 60_000;
+          console.log(`[TeamClaude] Rotation gate (shadow): session ${(sessionId || '').slice(0, 8)} `
+            + `(families: ${this.rotationLedger.familiesOf(sessionId).join(',') || '-'}) `
+            + `would block "${a?.name}"`);
+        }
+      }
+    }
+
     // Dynamic routing needs a cache identity, not merely the old optional
     // load-distribution flag. A known session remains on its home account; a NEW
     // session is ranked dynamically. `distributeSessions` still adds active-load
@@ -335,10 +388,10 @@ export class AccountManager {
       || (this.routingPolicy.mode === 'dynamic' && this.routingPolicy.preserveSessionAffinity));
     let account = null;
     if (sessionAware && !this._pinnedAccountForModel(model, advisorModel)) {
-      account = this._selectForSession(sessionId, exclude, model, advisorModel);
+      account = this._selectForSession(sessionId, effectiveExclude, model, advisorModel);
     }
     if (!account && advisorModel) {
-      account = this._select(exclude, model, advisorModel, false);
+      account = this._select(effectiveExclude, model, advisorModel, false);
       if (!account) {
         // Throttled so a busy advisor session doesn't flood the activity log.
         if (Date.now() >= (this._advisorDegradeLogAt || 0)) {
@@ -347,21 +400,72 @@ export class AccountManager {
         }
       }
     }
-    if (!account) account = this._select(exclude, model, null, true);
+    if (!account) account = this._select(effectiveExclude, model, null, true);
     if (!account) return null;
     // Shadow evidence is per REQUEST decision (not reevaluate ticks), and must
     // cover the session path Claude Code actually uses. Observe once per
     // external call — probe-held recursion must not double-count.
     if (this.routingPolicy.mode === 'shadow' && !_shadowObserved) {
-      this._observeShadowDecision(exclude, model, advisorModel);
+      this._observeShadowDecision(effectiveExclude, model, advisorModel);
       _shadowObserved = true;
     }
     // Request-path state transition: claim the half-open probe slot (if any)
     // before any await. Status/TUI reads never reach here.
     if (this._acquireCircuitProbe(account)) return account;
-    const nextExclude = exclude instanceof Set ? new Set(exclude) : new Set();
+    const nextExclude = new Set(effectiveExclude);
     nextExclude.add(account.index);
-    return this.getActiveAccount(nextExclude, model, advisorModel, sessionId, _shadowObserved);
+    return this.getActiveAccount(nextExclude, model, advisorModel, sessionId, _shadowObserved, _gateObserved);
+  }
+
+  /**
+   * Mark a family into the session ledger after a SUCCESSFUL /v1/messages
+   * response (status<300). Never call on count_tokens or failed attempts — a
+   * failed failover must not self-mark and then block the retry.
+   */
+  noteServedFamily(sessionId, accountIndex) {
+    if (!sessionId) return;
+    const account = this.accounts[accountIndex];
+    if (!account) return;
+    const family = account.historyFamily || resolveHistoryFamily(account);
+    const isStrictTier = Array.isArray(account.acceptsHistoryFamilies);
+    this.rotationLedger.mark(sessionId, family, { isStrictTier });
+  }
+
+  /** Operator hand-back after fleet-side transcript repair. Loud + counted. */
+  resetSessionHistory(sessionId) {
+    return this.rotationLedger.clear(sessionId);
+  }
+
+  /**
+   * Typed-409 predicate for the null-account branch: the only otherwise-
+   * _isAvailable accounts for this model are gate-blocked. Recomputed
+   * model-scoped against _isAvailable (not the stale exclude set).
+   */
+  rotationGateRefusal(sessionId, model = null, advisorModel = null, tried = null) {
+    return this.rotationLedger.gateBlocksAllAvailable(sessionId, this.accounts, {
+      mode: this.rotationGate.mode,
+      tried,
+      isAvailable: (a) => this._isAvailable(a, model, advisorModel),
+    });
+  }
+
+  setRotationGate(gate = {}) {
+    const mode = ['enforce', 'shadow', 'off'].includes(gate?.mode) ? gate.mode : 'enforce';
+    this.rotationGate = { mode };
+    return this.rotationGate;
+  }
+
+  exportSessionFamilies() {
+    return this.rotationLedger.export();
+  }
+
+  restoreSessionFamilies(saved) {
+    const declared = this.accounts.flatMap(a => {
+      const names = [a.historyFamily].filter(Boolean);
+      if (Array.isArray(a.acceptsHistoryFamilies)) names.push(...a.acceptsHistoryFamilies);
+      return names;
+    });
+    this.rotationLedger.restore(saved, declared);
   }
 
   /** Record a strip-and-degrade for an advisor id (blocked / pin-unservable /
@@ -1831,6 +1935,9 @@ export class AccountManager {
     set('models', disk.models || null);
     set('acceptsModels', Array.isArray(disk.acceptsModels) ? disk.acceptsModels.map(String) : null);
     set('strictModelMap', !!disk.strictModelMap);
+    set('historyFamily', resolveHistoryFamily(disk));
+    set('acceptsHistoryFamilies', Array.isArray(disk.acceptsHistoryFamilies)
+      ? disk.acceptsHistoryFamilies.map(String) : null);
     return changed;
   }
 
@@ -1931,6 +2038,7 @@ export class AccountManager {
       routingPolicy: { ...this.routingPolicy },
       shadowDecisions: { ...this._shadowDecisions },
       advisorDegrades: this._advisorDegrades,
+      rotationGate: this.rotationLedger.statusSnapshot(this.rotationGate.mode),
       routes: this.getRoutes(),
       sessions: { ...sessions, distribute: this.distributeSessions },
       accounts: this.accounts.map(a => ({
@@ -1950,6 +2058,9 @@ export class AccountManager {
           strictModelMap: a.strictModelMap,
           acceptsModels: a.acceptsModels ? [...a.acceptsModels] : null,
         },
+        historyFamily: a.historyFamily || null,
+        acceptsHistoryFamilies: a.acceptsHistoryFamilies
+          ? [...a.acceptsHistoryFamilies] : null,
         sessions: sessions.perAccount[a.index] || 0,
         quota: { ...a.quota },
         usage: { ...a.usage },

@@ -24,6 +24,7 @@ const EXPECTED_FEATURES = [
   'model-preflight',
   'provenance-t7',
   'quota-admission-gate',
+  'rotation-gate',
   'serveable-availability',
   'sessions-endpoint',
 ];

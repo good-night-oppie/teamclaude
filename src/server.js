@@ -25,6 +25,7 @@ registerBuildFeature('serveable-availability');
 registerBuildFeature('quota-admission-gate');
 registerBuildFeature('sessions-endpoint');
 registerBuildFeature('provenance-t7');
+registerBuildFeature('rotation-gate');
 
 /** Path class for T5 last_request / ctx gating. */
 export function classifySessionPath(url) {
@@ -196,6 +197,22 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
           sessions,
           absent: SESSIONS_ABSENT,
         }, null, 2));
+        return;
+      }
+
+      // T2: fleet-side repair hand-back. Clears the session's served-family
+      // ledger AFTER out-of-band transcript repair. Loopback-unauthenticated
+      // under the existing control-endpoint trust model — loud log + counter
+      // so erasure of safety evidence is never silent.
+      const historyReset = (req.url || '').match(/^\/teamclaude\/session\/([^/]+)\/history-reset$/);
+      if (req.method === 'POST' && historyReset) {
+        const sessionId = decodeURIComponent(historyReset[1]);
+        const cleared = accountManager.resetSessionHistory(sessionId);
+        console.log(`[TeamClaude] history-reset: session ${sessionId.slice(0, 8)}… `
+          + `(cleared=${!!cleared}) — ledger evidence erased; rotation legal again only if `
+          + `fleet-side repair already removed foreign transcript artifacts`);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, cleared: !!cleared, sessionId }));
         return;
       }
 
@@ -999,6 +1016,48 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       });
       return;
     }
+
+    // T2 rotation gate: typed 409 at the TOP of the null-account branch —
+    // strictly BEFORE holdBudgetMs sleep and exhaustedRetries inline wait.
+    // Recompute gate-blocked model-scoped against _isAvailable; otherwise a
+    // blocked session hangs holdSeconds then gets the forbidden lying 429.
+    const gateRefusal = accountManager.rotationGateRefusal?.(
+      ctx.sessionId, ctx.model, ctx.advisorModel, ctx.tried);
+    if (gateRefusal) {
+      const id8 = (ctx.sessionId || '').slice(0, 8);
+      const families = gateRefusal.families.join(',') || '?';
+      const blockedNames = gateRefusal.blockedAccounts;
+      const msg = `Session ${id8} history contains artifacts from family `
+        + `"${gateRefusal.families[0] || '?'}" not accepted by the only serveable `
+        + `account(s) [${blockedNames.join(', ')}] for model ${ctx.model || '?'}. `
+        + `Start a new session, pin an account (/tc-acct <name>), or clear the `
+        + `ledger after fleet-side repair (POST /teamclaude/session/<id>/history-reset).`;
+      console.log(`[TeamClaude] Rotation gate: session ${id8} (families: ${families}) `
+        + `blocked from "${blockedNames.join(',')}" — history incompatible`);
+      accountManager.rotationLedger.noteRefusal();
+      ctx.status = 409;
+      ctx.account = '(history-gate)';
+      if (!res.headersSent) {
+        res.writeHead(409, {
+          'Content-Type': 'application/json',
+          'x-teamclaude-refusal': 'session-history-incompatible',
+        });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'invalid_request_error', message: msg },
+        }));
+      }
+      hooks.onRequestEnd?.(reqId, {
+        method: req.method, path: req.url, account: '(history-gate)',
+        status: 409, model: ctx.model, sessionId: ctx.sessionId,
+      });
+      emitProvenance(ctx, {
+        final: true, outcome: 'session-history-incompatible', response_status: 409,
+        account: ctx.account, attempt: ctx.attempt || 0,
+      });
+      return;
+    }
+
     ctx.status = 429;
     ctx.account = '(none available)';
     const status = accountManager.getStatus();
@@ -1421,6 +1480,25 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     getLog()?.write(`\n\n=== RESPONSE ${upstreamRes.status} ===\n${formatHeaders(upstreamRes.headers)}`);
 
     ctx.status = upstreamRes.status;
+
+    // T2: mark served family ONLY on successful /v1/messages (path-exact;
+    // count_tokens excluded — adds no transcript artifact). Never at request
+    // start: a failed failover must not self-mark.
+    if (upstreamRes.status < 300 && ctx.pathClass === 'messages' && ctx.sessionId) {
+      accountManager.noteServedFamily?.(ctx.sessionId, account.index);
+    } else if (
+      upstreamRes.status >= 400 && upstreamRes.status < 500 && upstreamRes.status !== 429
+      && ctx.pathClass === 'messages'
+      && Array.isArray(account.acceptsHistoryFamilies)
+      && ctx.sessionId
+    ) {
+      // Gate-miss smoke alarm (option (c) demoted to telemetry): a strict tier
+      // 4xx'd a messages request — append the session's known family set.
+      const known = accountManager.rotationLedger?.familiesOf(ctx.sessionId) || [];
+      console.log(`[TeamClaude] Strict-tier ${upstreamRes.status} on "${account.name}" `
+        + `for session ${(ctx.sessionId || '').slice(0, 8)} `
+        + `(ledger families: ${known.join(',') || 'none'}) — gate-miss telemetry`);
+    }
 
     // Build response headers (skip hop-by-hop and encoding headers). The
     // connection-specific names are also illegal on an HTTP/2 response — when

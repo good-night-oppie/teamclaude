@@ -216,6 +216,7 @@ async function serverCommand() {
     ramp: config.stormRamp,
     distributeSessions: config.distributeSessions,
     routingPolicy: config.routingPolicy,
+    rotationGate: config.rotationGate,
   });
 
   // Restore quota observed in a previous run so a restart doesn't lose rotation
@@ -227,16 +228,21 @@ async function serverCommand() {
   });
   if (savedState?.quota) accountManager.restoreQuotaState(savedState.quota);
   if (savedState?.shadowDecisions) accountManager.restoreShadowDecisions(savedState.shadowDecisions);
+  if (savedState?.sessionFamilies) accountManager.restoreSessionFamilies(savedState.sessionFamilies);
 
   // With quota restored, pick the best account up front (highest priority /
   // soonest-resetting weekly window) instead of defaulting to the first one.
   accountManager.selectActiveAccount();
 
-  // Periodically persist quota + shadow evidence (and once more on shutdown).
+  // Periodically persist quota + shadow evidence + sessionFamilies (and once
+  // more on shutdown). sessionFamilies rewrite every 60s even while the gate
+  // is inert (always-on marking) — "zero config ⇒ zero change" scopes to
+  // ROUTING only (T2 design amendment #7).
   const persistQuotaState = () =>
     saveState({
       quota: accountManager.exportQuotaState(),
       shadowDecisions: accountManager.exportShadowDecisions(),
+      sessionFamilies: accountManager.exportSessionFamilies(),
     })
       .catch(err => console.error(`[TeamClaude] Failed to save quota state: ${err.message}`));
   let quotaSaveInterval = null;
@@ -307,8 +313,10 @@ async function serverCommand() {
     // Pick up route table + routing-policy edits atomically with account policy.
     config.routes = diskConfig.routes || [];
     config.routingPolicy = diskConfig.routingPolicy || { mode: 'priority-first' };
+    config.rotationGate = diskConfig.rotationGate || { mode: 'enforce' };
     accountManager.setRoutes(config.routes);
     accountManager.setRoutingPolicy(config.routingPolicy);
+    accountManager.setRotationGate(config.rotationGate);
     // Apply an sx.org key/mode change made on disk (e.g. via POST /teamclaude/reload).
     const diskSxKey = diskConfig.sx?.apiKey || null;
     const diskSxMode = diskConfig.sx?.mode || 'always';
