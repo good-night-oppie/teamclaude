@@ -97,3 +97,45 @@ test('a live request uses a reloaded modelMap without rebuilding AccountManager'
     await close(proxy); await close(upstream);
   }
 });
+
+test('reload deletions win: removed modelMap and blockedModels stay gone after a simulated save', async () => {
+  const mem = {
+    accounts: [account(8000, { modelMap: { keep: 'x', drop: 'y' }, acceptsModels: ['x'] })],
+    blockedModels: ['*fable*', '*preview*'],
+    routes: [],
+  };
+  const am = new AccountManager(mem.accounts, 0.98);
+  // Disk deletes the whole modelMap, acceptsModels, and blockedModels.
+  const disk = {
+    accounts: [{
+      name: 'deepseek', type: 'apikey', apiKey: 'k',
+      upstream: 'http://127.0.0.1:8000', priority: 80,
+    }],
+    routes: [],
+  };
+  await syncAccountsFromDisk(disk, mem, am);
+
+  assert.equal(am.accounts[0].modelMap, null, 'manager must drop deleted modelMap');
+  assert.equal(am.accounts[0].acceptsModels, null);
+  assert.equal('modelMap' in mem.accounts[0], false, 'mem config must not resurrect modelMap');
+  assert.equal('acceptsModels' in mem.accounts[0], false);
+  assert.equal('blockedModels' in mem, false, 'top-level blockedModels deletion must win');
+
+  // Simulated TUI save: serialize mem back. Deleted keys must stay absent.
+  const saved = JSON.parse(JSON.stringify(mem));
+  assert.equal('modelMap' in saved.accounts[0], false);
+  assert.equal('blockedModels' in saved, false);
+});
+
+test('reload deletes a single modelMap entry without resurrecting it on save', async () => {
+  const mem = {
+    accounts: [account(8000, { modelMap: { a: '1', b: '2' } })],
+  };
+  const am = new AccountManager(mem.accounts, 0.98);
+  await syncAccountsFromDisk({
+    accounts: [account(8000, { modelMap: { a: '1' } })],
+  }, mem, am);
+  assert.deepEqual(am.accounts[0].modelMap, { a: '1' });
+  assert.deepEqual(mem.accounts[0].modelMap, { a: '1' });
+  assert.equal('b' in mem.accounts[0].modelMap, false);
+});
