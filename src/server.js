@@ -786,12 +786,14 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     accountManager.updateQuota(account.index, rateLimitHeaders);
 
     // Custom-adapter health is account-specific. A locally supervised adapter
-    // returning 502/503/504 means THIS provider path is unhealthy, unlike an
+    // returning any 5xx means THIS provider path is unhealthy, unlike an
     // arbitrary model/client 4xx (never retry) or Anthropic's quota/rate 429
     // (handled below). Open its circuit and try another eligible account before
     // any response headers reach the client. The response body is discarded so
-    // the underlying socket returns to the pool cleanly.
-    if (account.upstream && [502, 503, 504].includes(upstreamRes.status)) {
+    // the underlying socket returns to the pool cleanly. (A bare 500 used to be
+    // scored as provider *health*, which reset consecutiveFailures and pinned
+    // the 2s→60s backoff at its floor.)
+    if (account.upstream && upstreamRes.status >= 500) {
       accountManager.noteProviderResult(account.index, {
         ok: false, status: upstreamRes.status, latencyMs: Date.now() - attemptStartedAt,
       });

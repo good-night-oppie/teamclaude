@@ -128,3 +128,82 @@ test('custom adapter 400 is relayed and heals transport health; it never fails o
     await close(proxy); await close(bad); await close(good);
   }
 });
+
+// A custom-upstream 500 is provider failure, not health. Scoring it as ok resets
+// consecutiveFailures and pins the advertised 2s→60s backoff at its 2s floor.
+test('custom adapter 500 opens circuit and fails over (never scored as health)', async () => {
+  let badHits = 0;
+  let goodHits = 0;
+  const bad = http.createServer((_req, res) => {
+    badHits++;
+    res.writeHead(500, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'internal' }));
+  });
+  const good = http.createServer((_req, res) => {
+    goodHits++;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ id: 'ok', type: 'message', model: 'served-good' }));
+  });
+  const badPort = await listen(bad);
+  const goodPort = await listen(good);
+  const am = new AccountManager([
+    { name: 'bad', type: 'apikey', apiKey: 'k1', upstream: `http://127.0.0.1:${badPort}`, priority: 0 },
+    { name: 'good', type: 'apikey', apiKey: 'k2', upstream: `http://127.0.0.1:${goodPort}`, priority: 1 },
+  ]);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: 'http://invalid' });
+  const proxyPort = await listen(proxy);
+  try {
+    const out = await request(proxyPort);
+    assert.equal(out.status, 200);
+    assert.equal(badHits, 1);
+    assert.equal(goodHits, 1);
+    assert.equal(am.accounts[0].consecutiveFailures, 1, '500 must not reset the breaker');
+    assert.ok(am.accounts[0].circuitOpenUntil > Date.now());
+  } finally {
+    await close(proxy); await close(bad); await close(good);
+  }
+});
+
+test('consecutive custom-upstream 500s escalate openUntil toward the 60s cap', async () => {
+  const bad = http.createServer((_req, res) => {
+    res.writeHead(500, { 'content-type': 'application/json' });
+    res.end('{"error":"internal"}');
+  });
+  const badPort = await listen(bad);
+  const am = new AccountManager([
+    { name: 'solo', type: 'apikey', apiKey: 'k1', upstream: `http://127.0.0.1:${badPort}` },
+  ]);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: 'http://invalid' });
+  const proxyPort = await listen(proxy);
+  const openMs = [];
+  try {
+    for (let i = 0; i < 7; i++) {
+      // Allow the next trial: clear an open circuit as if its window elapsed.
+      am.accounts[0].circuitOpenUntil = null;
+      const before = Date.now();
+      await request(proxyPort);
+      const until = am.accounts[0].circuitOpenUntil;
+      assert.ok(until > before, `failure #${i + 1} must open the circuit`);
+      openMs.push(until - before);
+      assert.equal(am.accounts[0].consecutiveFailures, i + 1);
+    }
+    // 2s, 4s, 8s, 16s, 32s, 60s, 60s — allow ±500ms clock skew on the wall measurement.
+    const expected = [2000, 4000, 8000, 16000, 32000, 60000, 60000];
+    for (let i = 0; i < expected.length; i++) {
+      assert.ok(Math.abs(openMs[i] - expected[i]) < 800,
+        `openMs[${i}]=${openMs[i]} want ~${expected[i]}`);
+    }
+    assert.ok(openMs[5] >= 50_000, 'backoff must leave the 2s floor and approach 60s');
+  } finally {
+    await close(proxy); await close(bad);
+  }
+});
+
+test('noteProviderResult backoff formula hits the 60s cap and stays there', () => {
+  const am = new AccountManager([
+    { name: 'a', type: 'apikey', apiKey: 'k', upstream: 'http://127.0.0.1:9' },
+  ]);
+  const opens = [];
+  for (let i = 0; i < 8; i++) opens.push(am.noteProviderResult(0, { ok: false, status: 500 }));
+  assert.deepEqual(opens, [2000, 4000, 8000, 16000, 32000, 60000, 60000, 60000]);
+});
