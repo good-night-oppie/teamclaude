@@ -488,3 +488,27 @@ test('T9-2: promoting into dynamic clears stale eval clocks and current indices'
   assert.equal(am.getActiveAccount(null, model).name, 'dynamic-best',
     'first request after promotion must re-evaluate, not honor the stale index/clock');
 });
+
+test('T9-3: dynamic session affinity yields to a strictly cheaper cost tier', () => {
+  const am = new AccountManager([
+    oauth('cheap', { priority: 50, costTier: 0 }),
+    oauth('expensive-home', { priority: 0, costTier: 1 }),
+  ], 0.98, { distributeSessions: true, routingPolicy: { mode: 'dynamic' } });
+  measured(am, 0, { r7: NOW + 90 * H });
+  measured(am, 1, { r7: NOW + H });
+  am.recordSession('s1', 1); // pinned on the expensive tier
+  assert.equal(am.getActiveAccount(null, 'claude-opus-4-8', null, 's1').name, 'cheap',
+    'a cheaper eligible tier must reclaim the session; affinity must not trap it forever');
+});
+
+test('T9-3: dynamic session affinity holds across same-tier rank changes', () => {
+  const am = new AccountManager([
+    oauth('home', { priority: 0, costTier: 0 }),
+    oauth('new-best', { priority: 20, costTier: 0 }),
+  ], 0.98, { distributeSessions: true, routingPolicy: { mode: 'dynamic' } });
+  measured(am, 0, { r7: NOW + 96 * H });
+  measured(am, 1, { r7: NOW + H }); // better reset, same cost tier
+  am.recordSession('s1', 0);
+  assert.equal(am.getActiveAccount(null, 'claude-opus-4-8', null, 's1').name, 'home',
+    'same-tier reset-time winners must not thrash a live prompt cache');
+});
