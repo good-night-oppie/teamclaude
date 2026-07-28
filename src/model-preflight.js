@@ -79,6 +79,9 @@
 // not a working instruction.
 
 import { routabilityOf, pinnedRoutabilityOf, clientAllowlistVerdict } from './model-namespace.js';
+import { registerBuildFeature } from './build-identity.js';
+
+registerBuildFeature('model-preflight');
 
 const MODEL_FLAG = '--model';
 const MODEL_EQ = '--model=';

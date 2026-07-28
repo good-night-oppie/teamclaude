@@ -3,6 +3,9 @@ import { sameIdentity } from './identity.js';
 import { weeklyBucketForModel, modelGlobMatches } from './model.js';
 import { SessionTracker } from './session-tracker.js';
 import { invalidateNormalizedConfigView } from './model-namespace.js';
+import { registerBuildFeature } from './build-identity.js';
+
+registerBuildFeature('dynamic-routing');
 
 // Re-exported for callers that import these model helpers from here.
 export { isFableModel, parseRequestModel, parseAdvisorModel } from './model.js';

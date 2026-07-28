@@ -13,6 +13,13 @@ import { requestModelIds, blockedIdInSet, collisionIdInSet } from './model-names
 import { BodyWriter } from './request-log.js';
 import { upstreamFetch } from './upstream-fetch.js';
 import { tunnelTls } from './sx.js';
+import { buildIdentity, registerBuildFeature } from './build-identity.js';
+// Ensure the model-preflight layer's tag is registered even when the CLI entry
+// has not been loaded (status via createProxyServer alone).
+import './model-preflight.js';
+
+registerBuildFeature('audit-b1-b6');
+registerBuildFeature('ingress-collision-gate');
 
 
 export const HOP_BY_HOP_HEADERS = new Set([
@@ -88,7 +95,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
         const status = accountManager.getStatus();
         const extra = hooks.getStatusExtra?.() || {};
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ...extra, ...status }, null, 2));
+        res.end(JSON.stringify({ ...extra, ...status, build: buildIdentity() }, null, 2));
         return;
       }
 
