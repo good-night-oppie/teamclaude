@@ -491,18 +491,23 @@ export class AccountManager {
       const pinned = this.accounts[pinIdx];
       if (pinned && this._isAvailable(pinned, model, advisorModel) && !exclude?.has(pinIdx)) {
         // Dynamic mode preserves a healthy session home WITHIN its cost tier
-        // (prompt-cache locality). A strictly cheaper eligible tier may reclaim
-        // the session — the hard economic boundary must be able to pull back
-        // DOWN, not only escalate UP. Same-tier rank changes must not thrash a
-        // live cache. Shadow stays request-path NEUTRAL with distributeSessions
-        // and uses priority preemption like priority-first.
+        // (prompt-cache locality) when preserveSessionAffinity is on. A false
+        // flag must disable the pin on every path — including when
+        // distributeSessions already entered this method. A strictly cheaper
+        // eligible tier may reclaim the session — the hard economic boundary
+        // must be able to pull back DOWN, not only escalate UP. Same-tier rank
+        // changes must not thrash a live cache. Shadow stays request-path
+        // NEUTRAL with distributeSessions and uses priority preemption like
+        // priority-first.
         if (this.routingPolicy.mode === 'dynamic') {
-          const pinnedTier = this._costTierFor(pinned, model);
-          const cheaperEligible = this.accounts.some(a =>
-            this._isAvailable(a, model, advisorModel)
-            && !exclude?.has(a.index)
-            && this._costTierFor(a, model) < pinnedTier);
-          if (!cheaperEligible) return pinned;
+          if (this.routingPolicy.preserveSessionAffinity) {
+            const pinnedTier = this._costTierFor(pinned, model);
+            const cheaperEligible = this.accounts.some(a =>
+              this._isAvailable(a, model, advisorModel)
+              && !exclude?.has(a.index)
+              && this._costTierFor(a, model) < pinnedTier);
+            if (!cheaperEligible) return pinned;
+          }
         } else {
           const betterExists = this.accounts.some(a =>
             this._isAvailable(a, model, advisorModel) && !exclude?.has(a.index) && (a.priority || 0) < (pinned.priority || 0));

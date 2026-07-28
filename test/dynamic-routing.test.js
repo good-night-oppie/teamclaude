@@ -512,3 +512,34 @@ test('T9-3: dynamic session affinity holds across same-tier rank changes', () =>
   assert.equal(am.getActiveAccount(null, 'claude-opus-4-8', null, 's1').name, 'home',
     'same-tier reset-time winners must not thrash a live prompt cache');
 });
+
+test('T9-4: preserveSessionAffinity false disables the dynamic session pin', () => {
+  // With distributeSessions:true the session path is entered regardless of the
+  // flag; false must still refuse to honor the pin (otherwise the flag is a lie).
+  const am = new AccountManager([
+    oauth('best', { priority: 0, costTier: 0 }),
+    oauth('pinned-worse', { priority: 20, costTier: 0 }),
+  ], 0.98, {
+    distributeSessions: true,
+    routingPolicy: { mode: 'dynamic', preserveSessionAffinity: false },
+  });
+  measured(am, 0, { r7: NOW + H });
+  measured(am, 1, { r7: NOW + 96 * H });
+  am.recordSession('s1', 1);
+  assert.equal(am.getActiveAccount(null, 'claude-opus-4-8', null, 's1').name, 'best',
+    'false must disable affinity on the distributeSessions path, not only when it is off');
+});
+
+test('T9-4: preserveSessionAffinity true keeps the same-tier dynamic session home', () => {
+  const am = new AccountManager([
+    oauth('home', { priority: 0, costTier: 0 }),
+    oauth('new-best', { priority: 20, costTier: 0 }),
+  ], 0.98, {
+    distributeSessions: true,
+    routingPolicy: { mode: 'dynamic', preserveSessionAffinity: true },
+  });
+  measured(am, 0, { r7: NOW + 96 * H });
+  measured(am, 1, { r7: NOW + H });
+  am.recordSession('s1', 0);
+  assert.equal(am.getActiveAccount(null, 'claude-opus-4-8', null, 's1').name, 'home');
+});
