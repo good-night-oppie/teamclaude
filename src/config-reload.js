@@ -5,12 +5,31 @@
 // The function mutates the deliberately supplied memConfig + AccountManager,
 // which is its contract — both must move together or a later TUI save restores
 // stale startup policy over a successful disk reload.
+//
+// Deletions in the reloaded file MUST win. Replacing account records (rather
+// than spread-merging disk onto mem) is load-bearing: a spread keeps mem keys
+// absent from disk, and the next TUI save writes them back — resurrecting
+// modelMap/blockedModels the operator just removed.
 
 import { sameIdentity } from './identity.js';
 
 function findConfigAccount(config, account) {
   if (!Array.isArray(config?.accounts)) return -1;
   return config.accounts.findIndex(a => sameIdentity(a, account));
+}
+
+/** Disk is the authority for the account's config shape. Preserve mem-only
+ * credential material only when disk omitted it (e.g. importFrom-only entries
+ * whose tokens were resolved at startup and never written back). */
+function accountRecordFromDisk(memAcct, diskAcct) {
+  const merged = { ...diskAcct };
+  if (!diskAcct.accessToken && memAcct?.accessToken) {
+    merged.accessToken = memAcct.accessToken;
+    if (memAcct.refreshToken != null) merged.refreshToken = memAcct.refreshToken;
+    if (memAcct.expiresAt != null) merged.expiresAt = memAcct.expiresAt;
+  }
+  if (!diskAcct.apiKey && memAcct?.apiKey) merged.apiKey = memAcct.apiKey;
+  return merged;
 }
 
 export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager, {
@@ -30,6 +49,15 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     return -1;
   };
 
+  // Top-level operator policy the request path reads from the shared config:
+  // honor deletion the same way account fields do.
+  if (Object.prototype.hasOwnProperty.call(diskConfig || {}, 'blockedModels')) {
+    memConfig.blockedModels = Array.isArray(diskConfig.blockedModels)
+      ? [...diskConfig.blockedModels] : [];
+  } else {
+    delete memConfig.blockedModels;
+  }
+
   for (const diskAcct of (Array.isArray(diskConfig?.accounts) ? diskConfig.accounts : [])) {
     const mgrIdx = claim(diskAcct);
     if (mgrIdx < 0) {
@@ -47,7 +75,9 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     if (diskAcct.name && mgr.name !== diskAcct.name) mgr.name = diskAcct.name;
     const policyChanged = accountManager.updateAccountPolicy(mgr.index, diskAcct);
     const memIdx = findConfigAccount(memConfig, mgr);
-    if (memIdx >= 0) memConfig.accounts[memIdx] = { ...memConfig.accounts[memIdx], ...diskAcct };
+    if (memIdx >= 0) {
+      memConfig.accounts[memIdx] = accountRecordFromDisk(memConfig.accounts[memIdx], diskAcct);
+    }
     if (policyChanged.length) log(`[TeamClaude] Reloaded policy for "${mgr.name}": ${policyChanged.join(', ')}`);
 
     const wantDisabled = !!diskAcct.disabled;
