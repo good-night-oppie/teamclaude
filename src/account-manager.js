@@ -109,8 +109,11 @@ function makeAccount(acct, index) {
     consecutiveFailures: 0,
     circuitOpenUntil: null,
     // Half-open single-flight: at most one live request may probe an expired
-    // circuit. Availability checks read this flag but never set it.
-    circuitProbeInFlight: false,
+    // circuit. Stored as a claim timestamp so a leaked claim (request dies
+    // without noteProviderResult/releaseCircuitProbe) expires after
+    // CIRCUIT_PROBE_CLAIM_TTL_MS rather than hiding the account forever.
+    // Availability checks compare age but never clear or refresh the stamp.
+    circuitProbeInFlightAt: null,
     latencyEwmaMs: null,
     lastFailure: null,
     lastSuccessAt: null,
@@ -123,6 +126,16 @@ function makeAccount(acct, index) {
 // predicate can't drift.
 function modelMatches(declared, model) {
   return declared === model || declared.replace(/\[\d+m\]$/, '') === model;
+}
+
+/** Generous bound for a half-open probe claim. A claim older than this is
+ * treated as released: readers (_isAvailable) compare only; the next
+ * _acquireCircuitProbe re-claims by overwriting the stale timestamp. */
+const CIRCUIT_PROBE_CLAIM_TTL_MS = 120_000;
+
+function circuitProbeClaimFresh(account) {
+  return account.circuitProbeInFlightAt != null
+    && (Date.now() - account.circuitProbeInFlightAt) < CIRCUIT_PROBE_CLAIM_TTL_MS;
 }
 
 export class AccountManager {
@@ -730,7 +743,9 @@ export class AccountManager {
     if (account.upstream && account.circuitOpenUntil && Date.now() < account.circuitOpenUntil) {
       return false;
     }
-    if (account.upstream && account.circuitProbeInFlight) return false;
+    // Fresh claim blocks; a stale claim is treated as released (read-only —
+    // do not clear the stamp here; status/TUI must stay side-effect-free).
+    if (account.upstream && circuitProbeClaimFresh(account)) return false;
     // Model-scoped: _isNearQuota checks the shared 5h bucket plus only the weekly
     // bucket that governs this model, so a spent Fable/Sonnet bucket bars just
     // that family — the account still serves every other model normally.
@@ -765,24 +780,26 @@ export class AccountManager {
 
   /** Claim the half-open probe slot for a live request. Pure availability may
    * report an expired circuit as eligible; exactly one request may proceed to
-   * exercise it. Returns false when another probe is already in flight (or the
-   * circuit is still open). No-op (returns true) when there is no circuit. */
+   * exercise it. Returns false when another probe holds a fresh claim (or the
+   * circuit is still open). A claim older than CIRCUIT_PROBE_CLAIM_TTL_MS is
+   * treated as released and re-claimed by overwrite. No-op (returns true) when
+   * there is no circuit. */
   _acquireCircuitProbe(account) {
     if (!account?.upstream) return true;
     if (account.circuitOpenUntil && Date.now() < account.circuitOpenUntil) return false;
-    if (account.circuitProbeInFlight) return false;
+    if (circuitProbeClaimFresh(account)) return false;
     if (account.circuitOpenUntil && Date.now() >= account.circuitOpenUntil) {
-      account.circuitProbeInFlight = true;
+      account.circuitProbeInFlightAt = Date.now();
     }
     return true;
   }
 
   /** Drop a half-open probe claim without recording a provider result — used when
    * the request abandons the account before an upstream attempt (admit abort,
-   * pre-flight failover). noteProviderResult also clears the flag. */
+   * pre-flight failover). noteProviderResult also clears the stamp. */
   releaseCircuitProbe(accountIndex) {
     const a = this.accounts[accountIndex];
-    if (a) a.circuitProbeInFlight = false;
+    if (a) a.circuitProbeInFlightAt = null;
   }
 
   /** Whether a closed adapter can turn `model` into a model its upstream knows.
@@ -1414,7 +1431,7 @@ export class AccountManager {
   noteProviderResult(accountIndex, { ok, latencyMs = null, status = null, error = null } = {}) {
     const a = this.accounts[accountIndex];
     if (!a || !a.upstream) return 0;
-    a.circuitProbeInFlight = false;
+    a.circuitProbeInFlightAt = null;
     if (Number.isFinite(latencyMs) && latencyMs >= 0) {
       a.latencyEwmaMs = a.latencyEwmaMs == null ? latencyMs : (0.8 * a.latencyEwmaMs + 0.2 * latencyMs);
     }

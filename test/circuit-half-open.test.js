@@ -36,6 +36,61 @@ test('_isAvailable does not mutate circuitOpenUntil on an open or expired circui
   assert.equal(a.circuitOpenUntil, expired);
 });
 
+// RF-1: a leaked half-open probe claim must not hide the account forever.
+// Bound is 120s — claims older than that are treated as released (read-only
+// in _isAvailable; the next _acquireCircuitProbe re-claims by overwrite).
+const PROBE_CLAIM_TTL_MS = 120_000;
+
+test('stale probe claim no longer hides account; a new probe can claim', () => {
+  const am = new AccountManager([
+    { name: 'a', type: 'apikey', apiKey: 'k', upstream: 'http://127.0.0.1:9' },
+  ]);
+  const a = am.accounts[0];
+  a.circuitOpenUntil = Date.now() - 1;
+  a.consecutiveFailures = 1;
+  // Simulate a leaked claim from a request that never scored/released.
+  a.circuitProbeInFlightAt = Date.now() - PROBE_CLAIM_TTL_MS - 1;
+
+  assert.equal(am._isAvailable(a), true, 'stale claim must not hide the account');
+  assert.equal(am._acquireCircuitProbe(a), true, 'stale claim is re-claimable');
+  assert.ok(a.circuitProbeInFlightAt != null
+    && Date.now() - a.circuitProbeInFlightAt < 1000,
+    'acquire overwrites the stale timestamp with a fresh claim');
+});
+
+test('fresh probe claim still blocks concurrent probes', () => {
+  const am = new AccountManager([
+    { name: 'a', type: 'apikey', apiKey: 'k', upstream: 'http://127.0.0.1:9' },
+  ]);
+  const a = am.accounts[0];
+  a.circuitOpenUntil = Date.now() - 1;
+  a.consecutiveFailures = 1;
+  a.circuitProbeInFlightAt = Date.now();
+
+  assert.equal(am._isAvailable(a), false, 'fresh claim hides the account');
+  assert.equal(am._acquireCircuitProbe(a), false, 'fresh claim blocks a second probe');
+  const held = a.circuitProbeInFlightAt;
+  assert.equal(a.circuitProbeInFlightAt, held, 'failed acquire must not touch the claim');
+});
+
+test('status reads during a stale probe claim do not mutate', () => {
+  const am = new AccountManager([
+    { name: 'a', type: 'apikey', apiKey: 'k', upstream: 'http://127.0.0.1:9' },
+  ]);
+  const a = am.accounts[0];
+  a.circuitOpenUntil = Date.now() - 1;
+  const staleAt = Date.now() - PROBE_CLAIM_TTL_MS - 5_000;
+  a.circuitProbeInFlightAt = staleAt;
+
+  const expiredUntil = a.circuitOpenUntil;
+  assert.equal(am._isAvailable(a), true);
+  assert.equal(a.circuitProbeInFlightAt, staleAt, '_isAvailable must not clear or refresh');
+  assert.equal(a.circuitOpenUntil, expiredUntil, 'breaker timestamp untouched by availability');
+  am.getStatus();
+  assert.equal(a.circuitProbeInFlightAt, staleAt, 'getStatus must not clear or refresh');
+  assert.equal(a.circuitOpenUntil, expiredUntil, 'breaker timestamp untouched by status');
+});
+
 test('half-open allows exactly one concurrent trial request', async () => {
   let hits = 0;
   let releaseUpstream;
@@ -68,7 +123,7 @@ test('half-open allows exactly one concurrent trial request', async () => {
     });
     // Let the first request select and acquire the probe before the second starts.
     await new Promise(r => setTimeout(r, 30));
-    assert.equal(am.accounts[0].circuitProbeInFlight, true);
+    assert.ok(am.accounts[0].circuitProbeInFlightAt != null, 'probe claim timestamp set');
 
     const p2 = fetch(`http://127.0.0.1:${port}/v1/messages`, {
       method: 'POST',
@@ -86,7 +141,7 @@ test('half-open allows exactly one concurrent trial request', async () => {
     await r2.text();
     // After success the probe slot is free; the second request may have been
     // refused or served after — either way the in-flight stampede did not happen.
-    assert.equal(am.accounts[0].circuitProbeInFlight, false);
+    assert.equal(am.accounts[0].circuitProbeInFlightAt, null);
   } finally {
     releaseUpstream();
     await close(proxy); await close(upstream);
