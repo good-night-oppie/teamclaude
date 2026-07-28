@@ -22,6 +22,7 @@ const EXPECTED_FEATURES = [
   'dynamic-routing',
   'ingress-collision-gate',
   'model-preflight',
+  'provenance-t7',
   'quota-admission-gate',
   'serveable-availability',
   'sessions-endpoint',

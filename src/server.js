@@ -14,6 +14,7 @@ import { BodyWriter } from './request-log.js';
 import { upstreamFetch } from './upstream-fetch.js';
 import { tunnelTls } from './sx.js';
 import { buildIdentity, PROCESS_STARTED_AT, registerBuildFeature } from './build-identity.js';
+import { ProvenanceBuffer } from './provenance.js';
 // Ensure the model-preflight layer's tag is registered even when the CLI entry
 // has not been loaded (status via createProxyServer alone).
 import './model-preflight.js';
@@ -23,6 +24,7 @@ registerBuildFeature('ingress-collision-gate');
 registerBuildFeature('serveable-availability');
 registerBuildFeature('quota-admission-gate');
 registerBuildFeature('sessions-endpoint');
+registerBuildFeature('provenance-t7');
 
 /** Path class for T5 last_request / ctx gating. */
 export function classifySessionPath(url) {
@@ -97,6 +99,11 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
   const proxyApiKey = config.proxy?.apiKey;
   const logDir = config.logDir || null;
   const holdMs = (config.holdSeconds || 0) * 1000;
+  const provenance = new ProvenanceBuffer({
+    size: config.provenance?.bufferSize ?? 512,
+    filePath: config.provenance?.file ?? null,
+    maxFileBytes: config.provenance?.maxFileBytes ?? (32 << 20),
+  });
 
   if (logDir) {
     mkdir(logDir, { recursive: true }).catch(() => {});
@@ -128,6 +135,32 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
         const extra = hooks.getStatusExtra?.() || {};
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ...extra, ...status, build: buildIdentity() }, null, 2));
+        return;
+      }
+
+      // T7 provenance poll — pure read (copied slice; no cursor mutation).
+      // Consumers reset their cursor when boot_epoch changes; head_seq < cursor
+      // is a ring-overwrite hint only, not restart detection.
+      if (req.method === 'GET' && (req.url === '/teamclaude/provenance'
+          || (req.url || '').startsWith('/teamclaude/provenance?'))) {
+        let since = 0;
+        let limit = 256;
+        try {
+          const u = new URL(req.url, 'http://localhost');
+          since = Number(u.searchParams.get('since') || 0) || 0;
+          const lim = Number(u.searchParams.get('limit') || 256);
+          if (Number.isFinite(lim) && lim > 0) limit = Math.min(1024, lim);
+        } catch { /* keep defaults */ }
+        const snap = provenance.snapshot(since, limit);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          now: new Date().toISOString(),
+          boot_epoch: provenance.bootEpoch,
+          head_seq: snap.head_seq,
+          tail_seq: snap.tail_seq,
+          buffer_size: provenance.size,
+          events: snap.events,
+        }, null, 2));
         return;
       }
 
@@ -216,7 +249,9 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
     }
   };
 
-  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config });
+  const forward = createProxyRequestListener({
+    accountManager, upstream, logDir, hooks, sx, holdMs, config, provenance, listenerTag: 'b',
+  });
   const server = http.createServer(requestHandler);
 
   // Forward-proxy support (always on, so multiple claude instances can use
@@ -233,7 +268,9 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
     const c = await certsPromise;
     return { key: c.leafKeyPem, cert: c.leafCertPem };
   };
-  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: console.error, sx }));
+  server.on('connect', createConnectHandler({
+    config, accountManager, ensureLeaf, logDir, hooks, log: console.error, sx, provenance,
+  }));
   // Remote Control's real-time channel is a WebSocket, not a request/response
   // call — Node fires 'upgrade' for that handshake, never 'request', so it
   // needs its own listener (base-URL routing path; the MITM path wires the
@@ -333,6 +370,59 @@ export function relayHttpForward(req, res) {
 
 const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/files/', '/api/oauth/file_upload'];
 
+/** Hostname of account.upstream || default upstream — never a full URL. */
+function provenanceUpstreamHost(account, defaultUpstream) {
+  const raw = account?.upstream || defaultUpstream;
+  if (!raw) return null;
+  try { return new URL(raw).hostname; } catch {
+    return String(raw).split('/')[0] || null;
+  }
+}
+
+/** Same lookup rewriteModel uses — never re-parse sendBody. */
+function provenanceMappedModel(account, requested) {
+  if (requested == null) return null;
+  return account?.modelMap?.[requested] ?? requested;
+}
+
+/** Emit one attempt-terminal provenance event. Marks ctx.provFinal when final. */
+function emitProvenance(ctx, fields) {
+  if (!ctx?.provenance || !ctx.requestId) return;
+  if (fields.final) ctx.provFinal = true;
+  const account = fields._account || null;
+  const defaultUpstream = ctx.defaultUpstream;
+  ctx.provenance.push({
+    request_id: ctx.requestId,
+    session_id: ctx.sessionId ?? null,
+    method: ctx.method ?? null,
+    path: ctx.path ?? null,
+    requested_model: ctx.model ?? null,
+    advisor_model_requested: ctx.advisorModelRequested ?? null,
+    advisor_degraded: !!ctx.advisorDegraded,
+    attempt: fields.attempt ?? ctx.attempt ?? 0,
+    account: fields.account ?? (account?.name ?? ctx.account ?? null),
+    account_index: fields.account_index ?? (account != null ? account.index : null),
+    upstream_host: fields.upstream_host ?? (account ? provenanceUpstreamHost(account, defaultUpstream) : null),
+    mapped_model: fields.mapped_model ?? (account
+      ? provenanceMappedModel(account, ctx.model)
+      : (ctx.model ?? null)),
+    via_sx: fields.via_sx ?? !!ctx.viaSx,
+    log_file: fields.log_file ?? ctx.logFile ?? null,
+    usage: fields.usage ?? ctx.attemptRec?.usage,
+    timings: fields.timings ?? {
+      admit_ms: ctx.attemptRec?.admit_ms ?? null,
+      headers_ms: ctx.attemptRec?.headers_ms ?? null,
+      total_ms: fields.total_ms ?? ctx.attemptRec?.total_ms ?? null,
+    },
+    stream: fields.stream ?? !!ctx.attemptRec?.stream,
+    response_reported_model: fields.response_reported_model ?? ctx.attemptRec?.response_reported_model ?? null,
+    response_status: fields.response_status ?? null,
+    outcome: fields.outcome,
+    err_code: fields.err_code ?? null,
+    final: !!fields.final,
+  });
+}
+
 /**
  * Build the core proxy request listener — buffer the body, then forward with
  * account selection + retry (forwardRequest). Shared by the base HTTP server and
@@ -340,7 +430,10 @@ const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/files/', '/api/oauth/f
  * aware routing, and retry-on-quota behavior. Control endpoints (status/reload)
  * and the proxy-API-key gate live in the base server's wrapper, not here.
  */
-export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null }) {
+export function createProxyRequestListener({
+  accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {},
+  forcedPin = null, provenance = null, listenerTag = 'b',
+}) {
   let counter = 0;
   return async (req, res) => {
     try {
@@ -387,6 +480,8 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         const token = decodeURIComponent(afterPrefix.slice(0, tokenEnd));
         pinnedIndex = resolveAccountPin(accountManager, token);
         if (pinnedIndex == null) {
+          // Unknown-pin 404 precedes provenance request_id assignment — out of
+          // provenance scope (critique fix #2). Activity log still records it.
           const reqId = ++counter;
           const sessionId = req.headers['x-claude-code-session-id'] || null;
           if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(unknown pin: "${token}")`, status: 404, model: null, sessionId, pinned: false });
@@ -416,6 +511,9 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       }
 
       const reqId = ++counter;
+      // Composite id for BASE_URL vs CONNECT/MITM correlation (numeric reqId
+      // alone collides across the two independent counters).
+      const requestId = provenance && !isEventLog ? provenance.nextRequestId(listenerTag) : null;
       // Claude Code tags each session's requests with this header (present on
       // /v1/messages and count_tokens). Read from headers up front so it drives
       // session-aware routing (issue #109) and colors the TUI activity stream.
@@ -442,6 +540,26 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // nested in tools[]; every request-path gate quantifies over the full id
       // set {model, advisorModel} — see requestModelIds in model-namespace.js.
       let advisorModel = parseAdvisorModel(body);
+      // Capture PRE-STRIP advisor id so G9 degrade remains visible in provenance.
+      const advisorModelRequested = advisorModel;
+      let advisorDegraded = false;
+
+      const emitGate = (outcome, extra = {}) => {
+        if (!provenance || !requestId) return;
+        provenance.push({
+          request_id: requestId,
+          session_id: sessionId,
+          method: req.method,
+          path: req.url,
+          requested_model: model,
+          advisor_model_requested: advisorModelRequested,
+          advisor_degraded: advisorDegraded,
+          attempt: 0,
+          final: true,
+          outcome,
+          ...extra,
+        });
+      };
 
       // Model blocklist (issue #116): reject when the EXECUTOR id is blocked.
       // An advisor-only hit strip-and-degrades (G9): never 400 the executor turn
@@ -458,12 +576,14 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
           res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: `Model "${model}" is blocked by teamclaude (matched "${blockHit.pattern}").` } }));
         }
         hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: '(blocked)', status: 400, model, sessionId });
+        emitGate('rejected-blocked', { response_status: 400, account: '(blocked)' });
         return;
       }
       if (blockHit?.role === 'advisor' && advisorModel) {
         body = stripAdvisorModelField(body);
         accountManager.noteAdvisorDegrade('blocked', advisorModel, blockHit.pattern);
         advisorModel = null;
+        advisorDegraded = true;
       }
       // Account-name collision (T1): raw-BASE_URL clients bypass `teamclaude run`
       // preflight, so a request whose model id is really a configured ACCOUNT
@@ -493,12 +613,14 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
             }));
           }
           hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: '(collision)', status: 400, model, sessionId });
+          emitGate('rejected-collision', { response_status: 400, account: '(collision)' });
           return;
         }
         if (collisionHit?.role === 'advisor' && advisorModel) {
           body = stripAdvisorModelField(body);
           accountManager.noteAdvisorDegrade('collision', advisorModel, collisionHit.id);
           advisorModel = null;
+          advisorDegraded = true;
         }
       }
       // A /tc-acct pin intentionally bypasses route/quota/disabled selection,
@@ -510,12 +632,18 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: `Pinned account "${pinnedAccount.name}" cannot translate model "${model}" to an accepted provider model.` } }));
         hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: pinnedAccount.name, status: 400, model, sessionId });
+        emitGate('rejected-pin-unservable', {
+          response_status: 400,
+          account: pinnedAccount.name,
+          account_index: pinnedAccount.index,
+        });
         return;
       }
       if (pinnedAccount && advisorModel && !accountManager._acceptsModel(pinnedAccount, advisorModel)) {
         body = stripAdvisorModelField(body);
         accountManager.noteAdvisorDegrade('pin-unservable', advisorModel, pinnedAccount.name);
         advisorModel = null;
+        advisorDegraded = true;
       }
 
       // T4 admission gate — typed quota errors, never 200-with-refusal.
@@ -567,6 +695,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
             method: req.method, path: req.url, account: '(none available)',
             status: 429, model, sessionId,
           });
+          emitGate('exhausted-typed-429', { response_status: 429, account: '(none available)' });
           return;
         }
       }
@@ -577,6 +706,18 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       const ctx = {
         account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel,
         pinnedIndex, holdBudgetMs: holdMs, sessionId, pathClass, semantic,
+        provenance: isEventLog ? null : provenance,
+        requestId,
+        advisorModelRequested,
+        advisorDegraded,
+        method: req.method,
+        path: req.url,
+        defaultUpstream: upstream,
+        attempt: 0,
+        viaSx: false,
+        provFinal: false,
+        logFile: null,
+        attemptRec: null,
       };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
@@ -591,6 +732,14 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
           res.writeHead(502, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Internal proxy error' } }));
         }
+        if (!ctx.provFinal) {
+          emitProvenance(ctx, {
+            final: true,
+            outcome: 'upstream-error-relayed',
+            response_status: ctx.status,
+            err_code: err?.code ?? null,
+          });
+        }
       } finally {
         // Update last_request.account once selection is known (begin was pre-select).
         if (semantic && sessionId && ctx.account) {
@@ -598,6 +747,15 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
           if (ev?.lastRequest) ev.lastRequest.account = ctx.account;
         }
         accountManager.endSession(sessionId, { semantic });
+        // Safety net: every reqId-assigned request emits ≥1 terminal event.
+        if (ctx.provenance && ctx.requestId && !ctx.provFinal) {
+          const st = ctx.status;
+          let outcome = 'client-disconnect';
+          if (st != null && st >= 200 && st < 300) outcome = 'ok';
+          else if (st === 429) outcome = 'exhausted-typed-429';
+          else if (st != null && st >= 400) outcome = 'upstream-error-relayed';
+          emitProvenance(ctx, { final: true, outcome, response_status: st });
+        }
         if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, sessionId, pinned: ctx.pinnedIndex != null });
       }
     } catch (err) {
@@ -782,6 +940,7 @@ function openRequestLog(logDir, reqId) {
   let ended = false;
   const write = (s) => { if (!ended && s) ws.write(Buffer.from(String(s), 'latin1')); };
   return {
+    filename,
     write,
     // Stream a complete body buffer under a section header.
     body(label, buf, contentType) {
@@ -810,6 +969,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // Whether THIS attempt dials via sx.org. Undefined on the first call → derive
   // from the default policy ('always' routes; 'off'/'429' start direct).
   const route = useSx === undefined ? !!(sx?.useByDefault()) : useSx;
+  ctx.viaSx = route;
 
   // Select account, skipping any already tried (and failed) this request.
   // The model scopes availability so a Fable-exhausted account is skipped only
@@ -833,6 +993,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
           error: { type: 'rate_limit_error', message: 'Pinned account is unavailable (rate-limited, errored, or already tried). Retry shortly.' },
         }));
       }
+      emitProvenance(ctx, {
+        final: true, outcome: 'pinned-unavailable', response_status: 429,
+        account: ctx.account, attempt: ctx.attempt || 0,
+      });
       return;
     }
     ctx.status = 429;
@@ -852,7 +1016,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       ctx.holdBudgetMs -= waitMs;
       console.log(`[TeamClaude] All accounts exhausted — holding connection, retry in ${Math.ceil(waitMs / 1000)}s (${Math.ceil(ctx.holdBudgetMs / 1000)}s budget left)`);
       await new Promise(resolve => setTimeout(resolve, waitMs));
-      if (res.destroyed) return;
+      if (res.destroyed) {
+        emitProvenance(ctx, { final: true, outcome: 'client-disconnect', attempt: ctx.attempt || 0 });
+        return;
+      }
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
 
@@ -861,7 +1028,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       ctx.exhaustedRetries = exhaustedRetries + 1;
       console.log(`[TeamClaude] All accounts exhausted — waiting ${retryAfter}s before retry`);
       await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
-      if (res.destroyed) return;
+      if (res.destroyed) {
+        emitProvenance(ctx, { final: true, outcome: 'client-disconnect', attempt: ctx.attempt || 0 });
+        return;
+      }
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
     res.writeHead(429, {
@@ -875,6 +1045,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         message: `All ${accountManager.accounts.length} accounts exhausted. Retry in ${retryAfter}s.`,
       },
     }));
+    emitProvenance(ctx, {
+      final: true, outcome: 'exhausted-typed-429', response_status: 429,
+      account: ctx.account, attempt: ctx.attempt || 0,
+    });
     return;
   }
 
@@ -933,7 +1107,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   if (account.modelMap) {
     sendBody = rewriteModel(sendBody, account.modelMap, {
       stripUnmappedAdvisor: !!account.upstream,
-      onAdvisorStrip: (id) => accountManager.noteAdvisorDegrade('unmapped', id, account.name),
+      onAdvisorStrip: (id) => {
+        accountManager.noteAdvisorDegrade('unmapped', id, account.name);
+        ctx.advisorDegraded = true;
+      },
     });
   }
   // Content-Length must match the bytes we actually send. Gate-time advisor
@@ -948,7 +1125,14 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // request head+body are written once, just before the response is logged.
   let log = null;
   let reqLogged = false;
-  const getLog = () => (logDir ? (log ||= openRequestLog(logDir, reqId)) : null);
+  const getLog = () => {
+    if (!logDir) return null;
+    if (!log) {
+      log = openRequestLog(logDir, reqId);
+      ctx.logFile = log.filename;
+    }
+    return log;
+  };
   const logRequestHead = () => {
     const l = getLog();
     if (!l || reqLogged) return;
@@ -966,12 +1150,32 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // only until the response headers arrive — long enough to stagger the burst,
     // then released so streaming bodies don't tie up concurrency. Fail-open: a
     // client that disconnects while waiting just drops out.
+    const admitT0 = Date.now();
     if (!await accountManager.admit(account.index, () => res.destroyed)) {
       accountManager.releaseCircuitProbe(account.index);
+      emitProvenance(ctx, {
+        _account: account,
+        final: true,
+        outcome: 'client-disconnect',
+        attempt: ctx.attempt || 0,
+        timings: { admit_ms: Date.now() - admitT0, headers_ms: null, total_ms: Date.now() - admitT0 },
+      });
       return;
     }
+    const admitMs = Date.now() - admitT0;
     let upstreamRes;
+    // Attempt increments exactly once per upstream EGRESS (not per recursion).
+    ctx.attempt = (ctx.attempt || 0) + 1;
     const attemptStartedAt = Date.now();
+    ctx.attemptRec = {
+      usage: { input: null, output: null },
+      response_reported_model: null,
+      stream: false,
+      admit_ms: admitMs,
+      headers_ms: null,
+      total_ms: null,
+      startedAt: attemptStartedAt,
+    };
     try {
       upstreamRes = await upstreamFetch(upstreamUrl, {
         method,
@@ -979,6 +1183,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         body: ['GET', 'HEAD'].includes(method) ? undefined : sendBody,
         redirect: 'manual',
       }, sx, route);
+      ctx.attemptRec.headers_ms = Date.now() - attemptStartedAt;
     } finally {
       accountManager.release(account.index);
     }
@@ -1007,9 +1212,22 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       if (retryCount < maxRetries && !res.headersSent) {
         await upstreamRes.body?.cancel();
         console.log(`[TeamClaude] Custom upstream ${upstreamRes.status} on "${account.name}" — circuit open, failing over`);
+        emitProvenance(ctx, {
+          _account: account,
+          final: false,
+          outcome: 'failover-upstream-5xx',
+          response_status: upstreamRes.status,
+          attempt: ctx.attempt,
+          timings: {
+            admit_ms: admitMs,
+            headers_ms: ctx.attemptRec.headers_ms,
+            total_ms: Date.now() - attemptStartedAt,
+          },
+        });
         ctx.tried.add(account.index);
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
       }
+      // Fall through: retries exhausted or headersSent — relay as upstream-error.
     } else if (account.upstream) {
       // Reachable provider. A 4xx may be a bad request/model and remains
       // non-retryable, but it proves the adapter path itself is healthy.
@@ -1056,8 +1274,25 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
           console.log(`[TeamClaude] Quota rejection (429) on "${account.name}" — throttling ${hold}s and switching account`);
           accountManager.markRateLimited(account.index, hold);
         }
+        emitProvenance(ctx, {
+          _account: account,
+          final: false,
+          outcome: 'quota-429-rotate',
+          response_status: 429,
+          attempt: ctx.attempt,
+          timings: {
+            admit_ms: admitMs,
+            headers_ms: ctx.attemptRec.headers_ms,
+            total_ms: Date.now() - attemptStartedAt,
+          },
+        });
         ctx.tried.add(account.index);
-        if (res.destroyed) return;
+        if (res.destroyed) {
+          emitProvenance(ctx, {
+            _account: account, final: true, outcome: 'client-disconnect', attempt: ctx.attempt,
+          });
+          return;
+        }
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
       }
 
@@ -1085,7 +1320,25 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // 429ing upstream can't loop forever through sx.
       if (switchingToSx && retryCount < maxRetries) {
         console.log(`[TeamClaude] 429 on "${account.name}" — retrying via sx.org (fresh egress IP)`);
-        if (res.destroyed) return;
+        emitProvenance(ctx, {
+          _account: account,
+          final: false,
+          outcome: 'rate-429-inline-wait',
+          response_status: 429,
+          attempt: ctx.attempt,
+          via_sx: route,
+          timings: {
+            admit_ms: admitMs,
+            headers_ms: ctx.attemptRec.headers_ms,
+            total_ms: Date.now() - attemptStartedAt,
+          },
+        });
+        if (res.destroyed) {
+          emitProvenance(ctx, {
+            _account: account, final: true, outcome: 'client-disconnect', attempt: ctx.attempt,
+          });
+          return;
+        }
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, nextUseSx);
       }
 
@@ -1094,8 +1347,25 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // rate-limited account can't loop forever tying up the connection.
       if (retryAfter <= RATE_LIMIT_ABSORB_MAX_SECONDS && retryCount < maxRetries) {
         console.log(`[TeamClaude] Rate-limit 429 on "${account.name}" — waiting ${retryAfter}s, retrying same account (no switch)`);
+        emitProvenance(ctx, {
+          _account: account,
+          final: false,
+          outcome: 'rate-429-inline-wait',
+          response_status: 429,
+          attempt: ctx.attempt,
+          timings: {
+            admit_ms: admitMs,
+            headers_ms: ctx.attemptRec.headers_ms,
+            total_ms: Date.now() - attemptStartedAt,
+          },
+        });
         await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
-        if (res.destroyed) return;
+        if (res.destroyed) {
+          emitProvenance(ctx, {
+            _account: account, final: true, outcome: 'client-disconnect', attempt: ctx.attempt,
+          });
+          return;
+        }
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, nextUseSx);
       }
 
@@ -1108,6 +1378,18 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': String(retryAfter) });
         res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: `Rate limited; retry in ${retryAfter}s.` } }));
       }
+      emitProvenance(ctx, {
+        _account: account,
+        final: true,
+        outcome: 'rate-429-surfaced',
+        response_status: 429,
+        attempt: ctx.attempt,
+        timings: {
+          admit_ms: admitMs,
+          headers_ms: ctx.attemptRec.headers_ms,
+          total_ms: Date.now() - attemptStartedAt,
+        },
+      });
       return;
     }
 
@@ -1153,10 +1435,27 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
 
     res.writeHead(upstreamRes.status, responseHeaders);
 
+    const relayOutcome = (upstreamRes.status >= 200 && upstreamRes.status < 300)
+      ? 'ok'
+      : 'upstream-error-relayed';
+
     if (!upstreamRes.body) {
       const l = getLog();
       if (l) { l.write('\n\n=== RESPONSE BODY ===\n(empty)'); l.end(); }
       res.end();
+      emitProvenance(ctx, {
+        _account: account,
+        final: true,
+        outcome: relayOutcome,
+        response_status: upstreamRes.status,
+        attempt: ctx.attempt,
+        stream: false,
+        timings: {
+          admit_ms: admitMs,
+          headers_ms: ctx.attemptRec.headers_ms,
+          total_ms: Date.now() - attemptStartedAt,
+        },
+      });
       return;
     }
 
@@ -1168,22 +1467,54 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // whole (potentially ~1M-token) SSE body in memory.
       const l = getLog();
       const bw = l ? l.bodyWriter('RESPONSE BODY (streamed)', contentType) : null;
+      ctx.attemptRec.stream = true;
       await streamResponse(upstreamRes.body, res, account.index, accountManager, bw, {
         sessionId: ctx.sessionId,
         model: ctx.model,
         pathClass: ctx.pathClass,
-      });
+      }, ctx.attemptRec);
       l?.end();
+      const outcome = res.destroyed ? 'client-disconnect' : relayOutcome;
+      emitProvenance(ctx, {
+        _account: account,
+        final: true,
+        outcome,
+        response_status: upstreamRes.status,
+        attempt: ctx.attempt,
+        stream: true,
+        response_reported_model: ctx.attemptRec.response_reported_model,
+        usage: ctx.attemptRec.usage,
+        timings: {
+          admit_ms: admitMs,
+          headers_ms: ctx.attemptRec.headers_ms,
+          total_ms: Date.now() - attemptStartedAt,
+        },
+      });
     } else {
       const buf = Buffer.from(await upstreamRes.arrayBuffer());
       extractUsageFromBody(buf, account.index, accountManager, {
         sessionId: ctx.sessionId,
         model: ctx.model,
         pathClass: ctx.pathClass,
-      });
+      }, ctx.attemptRec);
       const l = getLog();
       if (l) { l.body('RESPONSE BODY', buf, contentType); l.end(); }
       res.end(buf);
+      emitProvenance(ctx, {
+        _account: account,
+        final: true,
+        outcome: relayOutcome,
+        response_status: upstreamRes.status,
+        attempt: ctx.attempt,
+        stream: false,
+        response_reported_model: ctx.attemptRec.response_reported_model,
+        usage: ctx.attemptRec.usage,
+        timings: {
+          admit_ms: admitMs,
+          headers_ms: ctx.attemptRec.headers_ms,
+          total_ms: Date.now() - attemptStartedAt,
+        },
+      });
     }
   } catch (err) {
     console.error(`[TeamClaude] Upstream error (account "${account.name}"):`, err.message);
@@ -1200,6 +1531,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         err.code === 'ETIMEDOUT' || err.code === 'UND_ERR_CONNECT_TIMEOUT' ||
         err.code === 'UND_ERR_HEADERS_TIMEOUT' || err.code === 'UND_ERR_BODY_TIMEOUT');
 
+    const errOutcome = err?.code === 'TEAMCLAUDE_BODY_TIMEOUT'
+      ? 'stream-idle-timeout'
+      : 'transport-error';
+
     // A custom loopback/provider adapter is an independent failure domain. A
     // connection error to its own upstream is NOT a poisoned process-wide
     // Anthropic socket pool: open that account's circuit and try the next route
@@ -1207,6 +1542,13 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // client-retry behavior below.
     if (isTransient && account.upstream && retryCount < maxRetries && !res.headersSent) {
       accountManager.noteProviderResult(account.index, { ok: false, error: err.message });
+      emitProvenance(ctx, {
+        _account: account,
+        final: false,
+        outcome: errOutcome,
+        attempt: ctx.attempt || 0,
+        err_code: err?.code ?? null,
+      });
       ctx.tried.add(account.index);
       console.log(`[TeamClaude] Custom upstream transport failure on "${account.name}" — circuit open, failing over`);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
@@ -1219,6 +1561,13 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // cleanly. If headers were already sent (a mid-stream body timeout), destroy
     // is the only option — the client sees a broken response and retries.
     if (isTransient) {
+      emitProvenance(ctx, {
+        _account: account,
+        final: true,
+        outcome: errOutcome,
+        attempt: ctx.attempt || 0,
+        err_code: err?.code ?? null,
+      });
       res.destroy();
       return;
     }
@@ -1229,6 +1578,13 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // a healthy account from rotation until a credential change). Instead skip
     // it for the rest of THIS request only and fail over to another account.
     if (retryCount < maxRetries && !res.headersSent) {
+      emitProvenance(ctx, {
+        _account: account,
+        final: false,
+        outcome: 'transport-error',
+        attempt: ctx.attempt || 0,
+        err_code: err?.code ?? null,
+      });
       ctx.tried.add(account.index);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
@@ -1247,6 +1603,14 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // sees a broken response and retries instead of hanging on an open socket.
       res.destroy();
     }
+    emitProvenance(ctx, {
+      _account: account,
+      final: true,
+      outcome: 'upstream-error-relayed',
+      response_status: 502,
+      attempt: ctx.attempt || 0,
+      err_code: err?.code ?? null,
+    });
   }
 }
 
@@ -1291,8 +1655,9 @@ export function readWithIdleTimeout(reader, ms) {
 /**
  * Stream an SSE response to the client, parsing usage data along the way.
  * `sessionCtx` (optional): { sessionId, model, pathClass } for T5 ctx recording.
+ * `attemptRec` (optional): mutable T7 attempt record for reported model + usage.
  */
-async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, sessionCtx = null) {
+async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, sessionCtx = null, attemptRec = null) {
   const reader = webStream.getReader();
   const idleMs = resolveBodyIdleTimeout();
   const decoder = new TextDecoder();
@@ -1321,7 +1686,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
       sseBuffer = events.pop(); // keep incomplete event
 
       for (const event of events) {
-        parseSSEUsage(event, accountIndex, accountManager, sessionCtx);
+        parseSSEUsage(event, accountIndex, accountManager, sessionCtx, attemptRec);
       }
 
       // Handle backpressure — also bail out if client disconnects,
@@ -1341,7 +1706,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
 
     // Parse any remaining buffer
     if (sseBuffer.trim()) {
-      parseSSEUsage(sseBuffer, accountIndex, accountManager, sessionCtx);
+      parseSSEUsage(sseBuffer, accountIndex, accountManager, sessionCtx, attemptRec);
     }
   } catch (err) {
     // A mid-stream idle timeout (or any read error) means the upstream went
@@ -1359,41 +1724,63 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
   }
 }
 
-function parseSSEUsage(event, accountIndex, accountManager, sessionCtx = null) {
+function parseSSEUsage(event, accountIndex, accountManager, sessionCtx = null, attemptRec = null) {
   const dataLine = event.split('\n').find(l => l.startsWith('data: '));
   if (!dataLine) return;
 
   try {
     const data = JSON.parse(dataLine.slice(6));
-    if (data.type === 'message_start' && data.message?.usage) {
-      const u = data.message.usage;
-      accountManager.updateUsage(accountIndex, u.input_tokens, 0);
-      // T5: observed window occupancy = input + cache_read + cache_creation.
-      // Excludes current-turn output (see absent.current_turn_output_tokens).
-      if (sessionCtx?.sessionId && sessionCtx.pathClass !== 'count_tokens') {
-        const contextTokens = (u.input_tokens || 0)
-          + (u.cache_read_input_tokens || 0)
-          + (u.cache_creation_input_tokens || 0);
-        accountManager.sessionTracker.noteUsage(
-          sessionCtx.sessionId,
-          sessionCtx.model,
-          contextTokens,
-          { pathClass: sessionCtx.pathClass || 'messages' },
-        );
+    if (data.type === 'message_start' && data.message) {
+      if (attemptRec && data.message.model != null) {
+        attemptRec.response_reported_model = data.message.model;
+      }
+      if (data.message.usage) {
+        const u = data.message.usage;
+        accountManager.updateUsage(accountIndex, u.input_tokens, 0);
+        if (attemptRec) {
+          attemptRec.usage = attemptRec.usage || { input: null, output: null };
+          attemptRec.usage.input = u.input_tokens ?? attemptRec.usage.input;
+        }
+        // T5: observed window occupancy = input + cache_read + cache_creation.
+        // Excludes current-turn output (see absent.current_turn_output_tokens).
+        if (sessionCtx?.sessionId && sessionCtx.pathClass !== 'count_tokens') {
+          const contextTokens = (u.input_tokens || 0)
+            + (u.cache_read_input_tokens || 0)
+            + (u.cache_creation_input_tokens || 0);
+          accountManager.sessionTracker.noteUsage(
+            sessionCtx.sessionId,
+            sessionCtx.model,
+            contextTokens,
+            { pathClass: sessionCtx.pathClass || 'messages' },
+          );
+        }
       }
     } else if (data.type === 'message_delta' && data.usage) {
       accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens);
+      if (attemptRec) {
+        attemptRec.usage = attemptRec.usage || { input: null, output: null };
+        attemptRec.usage.output = data.usage.output_tokens ?? attemptRec.usage.output;
+      }
     }
   } catch {
     // not valid JSON, skip
   }
 }
 
-function extractUsageFromBody(buffer, accountIndex, accountManager, sessionCtx = null) {
+function extractUsageFromBody(buffer, accountIndex, accountManager, sessionCtx = null, attemptRec = null) {
   try {
     const json = JSON.parse(buffer.toString());
+    if (attemptRec && json.model != null) {
+      attemptRec.response_reported_model = json.model;
+    }
     if (json.usage) {
       accountManager.updateUsage(accountIndex, json.usage.input_tokens, json.usage.output_tokens);
+      if (attemptRec) {
+        attemptRec.usage = {
+          input: json.usage.input_tokens ?? null,
+          output: json.usage.output_tokens ?? null,
+        };
+      }
       // Non-stream /v1/messages: same observed sum; count_tokens excluded.
       if (sessionCtx?.sessionId && sessionCtx.pathClass !== 'count_tokens') {
         const u = json.usage;
