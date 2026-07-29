@@ -142,15 +142,21 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
       // T7 provenance poll — pure read (copied slice; no cursor mutation).
       // Consumers reset their cursor when boot_epoch changes; head_seq < cursor
       // is a ring-overwrite hint only, not restart detection.
+      // Default limit = ring size: snapshot walks oldest→newest from head_seq, so
+      // a smaller default (historically 256 on a 512 ring) returned only the
+      // oldest half and looked like a "frozen newest ts" under load (R0/fugu-429).
       if (req.method === 'GET' && (req.url === '/teamclaude/provenance'
           || (req.url || '').startsWith('/teamclaude/provenance?'))) {
         let since = 0;
-        let limit = 256;
+        let limit = provenance.size;
         try {
           const u = new URL(req.url, 'http://localhost');
           since = Number(u.searchParams.get('since') || 0) || 0;
-          const lim = Number(u.searchParams.get('limit') || 256);
-          if (Number.isFinite(lim) && lim > 0) limit = Math.min(1024, lim);
+          const limRaw = u.searchParams.get('limit');
+          if (limRaw != null && limRaw !== '') {
+            const lim = Number(limRaw);
+            if (Number.isFinite(lim) && lim > 0) limit = Math.min(1024, lim);
+          }
         } catch { /* keep defaults */ }
         const snap = provenance.snapshot(since, limit);
         res.writeHead(200, { 'Content-Type': 'application/json' });

@@ -150,6 +150,137 @@ test('optional JSONL sink appends and queues across rotation', async () => {
   }
 });
 
+// R0 (fugu-429 incident): operator saw GET /teamclaude/provenance "newest" stuck
+// at 19:54Z for ~1.5h while traffic continued. Root cause is NOT a wedged writer —
+// snapshot(since=0, limit=256) on a size=512 ring returns the OLDEST 256 retained
+// events, so the response's last ts lags far behind tail while push() keeps working.
+test('R0: default provenance poll includes newest after ring exceeds old limit=256', async () => {
+  const buf = new ProvenanceBuffer({ size: 512, now: () => 1_000_000 });
+  for (let i = 0; i < 300; i++) {
+    buf.push({ request_id: `r-${i}`, attempt: 1, final: true, outcome: 'ok' });
+  }
+  const oldDefault = buf.snapshot(0, 256);
+  assert.equal(oldDefault.events.length, 256);
+  assert.ok(
+    oldDefault.events[oldDefault.events.length - 1].seq < oldDefault.tail_seq,
+    'limit=256 hides the newest half — the live "frozen newest ts" illusion',
+  );
+  // Writer not wedged: an unrelated subsequent event still lands.
+  buf.push({ request_id: 'after-storm', attempt: 1, final: true, outcome: 'ok' });
+  assert.equal(buf.snapshot(0, buf.size).events.at(-1).request_id, 'after-storm');
+
+  // Fill the live server ring past 256, then assert naked GET includes the newest.
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      id: 'msg_1', type: 'message', role: 'assistant', model: 'm',
+      content: [], usage: { input_tokens: 1, output_tokens: 1 },
+    }));
+  });
+  const upPort = await listen(upstream);
+  const am = new AccountManager([oauth('a')]);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upPort}`,
+    blockedModels: ['fill-*'],
+  });
+  const port = await listen(proxy);
+  try {
+    for (let i = 0; i < 300; i++) {
+      const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: `fill-${i}`, messages: [] }),
+      });
+      assert.equal(res.status, 400);
+      await res.text();
+    }
+    // Unrelated successful request after the fill storm.
+    const okRes = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-sonnet-4', messages: [] }),
+    });
+    assert.equal(okRes.status, 200);
+    await okRes.text();
+
+    const naked = await (await fetch(`http://127.0.0.1:${port}/teamclaude/provenance`)).json();
+    assert.ok(naked.events.length > 256, 'default limit must exceed the old 256 footgun');
+    const last = naked.events[naked.events.length - 1];
+    assert.equal(last.seq, naked.tail_seq, 'default poll must surface the newest event');
+    assert.equal(last.outcome, 'ok');
+    assert.equal(last.requested_model, 'claude-sonnet-4');
+    // Explicit small limit still reproduces the oldest-half illusion.
+    const capped = await (await fetch(
+      `http://127.0.0.1:${port}/teamclaude/provenance?limit=256`,
+    )).json();
+    assert.equal(capped.events.length, 256);
+    assert.ok(capped.events[capped.events.length - 1].seq < capped.tail_seq);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('R0: transient-429 wait path does not freeze the ring for later requests', async () => {
+  let hits = 0;
+  const upstream = http.createServer((_req, res) => {
+    hits++;
+    if (hits === 1) {
+      res.writeHead(429, { 'retry-after': '1', 'content-type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error' } }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      id: 'msg_1', type: 'message', role: 'assistant', model: 'm',
+      content: [], usage: { input_tokens: 2, output_tokens: 3 },
+    }));
+  });
+  const upPort = await listen(upstream);
+  const am = new AccountManager([
+    { name: 'sakana', type: 'apikey', apiKey: 'k', upstream: `http://127.0.0.1:${upPort}` },
+    oauth('other'),
+  ]);
+  // Point oauth account at a dead upstream so selection prefers sakana when mapped.
+  am.accounts[1].expiresAt = 0; // force other unusable via token-expired if selected
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upPort}`,
+  });
+  const port = await listen(proxy);
+  try {
+    const r1 = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'm', messages: [] }),
+    });
+    assert.equal(r1.status, 200);
+    await r1.text();
+
+    // Unrelated later request must still appear in the ring (writer not wedged).
+    const r2 = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'm', messages: [{ role: 'user', content: 'later' }] }),
+    });
+    assert.equal(r2.status, 200);
+    await r2.text();
+
+    const prov = await (await fetch(
+      `http://127.0.0.1:${port}/teamclaude/provenance?limit=512`,
+    )).json();
+    const waits = prov.events.filter(e => e.outcome === 'rate-429-inline-wait');
+    assert.ok(waits.length >= 1, '429-wait must emit non-final provenance');
+    const oks = prov.events.filter(e => e.final && e.outcome === 'ok');
+    assert.ok(oks.length >= 2, 'unrelated subsequent request must land in the ring');
+    assert.equal(prov.events[prov.events.length - 1].seq, prov.tail_seq);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
 test('GET /teamclaude/provenance returns boot_epoch and is pure-read', async () => {
   const am = new AccountManager([oauth('a')]);
   const a = am.accounts[0];

@@ -185,9 +185,14 @@ export class ProvenanceBuffer {
   /**
    * Pure read: copied ascending slice of events with seq > since.
    * No server-side cursor; never mutates the ring.
+   * Default limit is the ring size so a naked poll cannot omit the newest
+   * half (R0: limit=256 on size=512 looked like a frozen newest ts).
    */
-  snapshot(since = 0, limit = 256) {
-    const lim = Math.max(0, Math.min(Number(limit) || 0, this.size));
+  snapshot(since = 0, limit = undefined) {
+    const lim = Math.max(0, Math.min(
+      Number(limit == null ? this.size : limit) || 0,
+      this.size,
+    ));
     const sinceN = Number.isFinite(Number(since)) ? Number(since) : 0;
     if (this._count === 0) {
       return { head_seq: 0, tail_seq: 0, events: [] };
