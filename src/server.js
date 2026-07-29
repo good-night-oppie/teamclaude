@@ -65,9 +65,10 @@ export const HOP_BY_HOP_HEADERS = new Set([
 const PIN_PREFIX = '/tc-acct/';
 const INLINE_RETRY_AFTER_MAX_SECONDS = 15;
 // How long the proxy will absorb a rate-limit 429's retry-after inline (waiting
-// on the SAME account) before surfacing a 429 + retry-after to the client. A
-// rate-limit 429 never rotates accounts (that just moves the burst); it pauses
-// the account so concurrent requests wait, then retries the same account.
+// on the SAME account) before surfacing a 429 + retry-after to the client.
+// After `transient429RotateAfter` consecutive transient-429s on one account
+// (default 3; 0 = legacy never-rotate), the request cools that account down and
+// rotates — see the transient-429 branch in forwardRequest (R1 / fugu-429).
 const RATE_LIMIT_ABSORB_MAX_SECONDS =
   Number(process.env.TEAMCLAUDE_RATE_LIMIT_ABSORB_MAX_SECONDS) || 60;
 
@@ -726,6 +727,10 @@ export function createProxyRequestListener({
       const pathClass = classifySessionPath(req.url);
       const semantic = isSemanticSessionRequest(req.method, req.url);
       // reauthed: upstream #136 401-retry bound (one forced refresh per account per request)
+      const rotateRaw = config?.transient429RotateAfter;
+      const transient429RotateAfter = rotateRaw === undefined || rotateRaw === null
+        ? 3
+        : Math.max(0, Number(rotateRaw) || 0);
       const ctx = {
         account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel,
         pinnedIndex, holdBudgetMs: holdMs, sessionId, pathClass, semantic,
@@ -741,6 +746,8 @@ export function createProxyRequestListener({
         provFinal: false,
         logFile: null,
         attemptRec: null,
+        transient429RotateAfter,
+        transient429Counts: new Map(),
       };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
@@ -1411,34 +1418,71 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const switchingToSx = nextUseSx && !route;
       sx?.noteRateLimited(retryAfter);
 
-      // This is a rate-limit 429 (per-minute throttle), NOT quota exhaustion —
-      // quota rejection is handled above and is the only thing that rotates.
-      // Do NOT switch accounts here: moving the burst to the next account just
-      // throttles it too (thundering herd, #84) and discards this account's KV
-      // cache. Instead PAUSE this account so concurrent requests wait in admit()
-      // (capped, then released through a fresh ramp) instead of piling on, and
-      // retry the SAME account. The pause never marks the account throttled, so
-      // selection keeps choosing it.
+      // Transient rate-limit 429 (per-minute throttle), NOT quota exhaustion.
+      // Default: pause + retry the SAME account (#84 — don't move the burst).
+      // R1: after N consecutive transient-429s on this (request, account)
+      // (config transient429RotateAfter, default 3; 0 = legacy never-rotate),
+      // cool the account down and rotate like the quota-rejection path — but
+      // only when another eligible candidate exists (single-candidate keeps
+      // wait-retry).
       accountManager.pauseAccount(account.index, Math.min(retryAfter, RATE_LIMIT_ABSORB_MAX_SECONDS));
+
+      ctx.transient429Counts ??= new Map();
+      const consec = (ctx.transient429Counts.get(account.index) || 0) + 1;
+      ctx.transient429Counts.set(account.index, consec);
+      const rotateAfter = ctx.transient429RotateAfter ?? 3;
+
+      const waitTimings = {
+        admit_ms: admitMs,
+        headers_ms: ctx.attemptRec.headers_ms,
+        total_ms: Date.now() - attemptStartedAt,
+      };
+      emitProvenance(ctx, {
+        _account: account,
+        final: false,
+        outcome: 'rate-429-inline-wait',
+        response_status: 429,
+        attempt: ctx.attempt,
+        via_sx: route,
+        timings: waitTimings,
+      });
+
+      if (rotateAfter > 0 && consec >= rotateAfter && retryCount < maxRetries) {
+        const exclude = new Set(ctx.tried);
+        exclude.add(account.index);
+        const next = accountManager.getActiveAccount(
+          exclude, ctx.model, ctx.advisorModel, ctx.sessionId,
+        );
+        if (next) {
+          const cooldown = Math.max(retryAfter, 60);
+          console.log(`[TeamClaude] Rate-limit 429 on "${account.name}" — ${consec} consecutive transient-429s `
+            + `(cap ${rotateAfter}); cooling ${cooldown}s and switching account`);
+          accountManager.markRateLimited(account.index, cooldown);
+          emitProvenance(ctx, {
+            _account: account,
+            final: false,
+            outcome: 'transient-429-cap',
+            response_status: 429,
+            attempt: ctx.attempt,
+            timings: waitTimings,
+          });
+          ctx.tried.add(account.index);
+          if (res.destroyed) {
+            emitProvenance(ctx, {
+              _account: account, final: true, outcome: 'client-disconnect', attempt: ctx.attempt,
+            });
+            return;
+          }
+          return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+        }
+        // No next candidate — fall through to same-account wait / surface.
+      }
 
       // sx fresh-IP retry (still the same account) takes precedence over waiting.
       // Bounded by retryCount like the inline-wait path below, so a persistently
       // 429ing upstream can't loop forever through sx.
       if (switchingToSx && retryCount < maxRetries) {
         console.log(`[TeamClaude] 429 on "${account.name}" — retrying via sx.org (fresh egress IP)`);
-        emitProvenance(ctx, {
-          _account: account,
-          final: false,
-          outcome: 'rate-429-inline-wait',
-          response_status: 429,
-          attempt: ctx.attempt,
-          via_sx: route,
-          timings: {
-            admit_ms: admitMs,
-            headers_ms: ctx.attemptRec.headers_ms,
-            total_ms: Date.now() - attemptStartedAt,
-          },
-        });
         if (res.destroyed) {
           emitProvenance(ctx, {
             _account: account, final: true, outcome: 'client-disconnect', attempt: ctx.attempt,
@@ -1453,18 +1497,6 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // rate-limited account can't loop forever tying up the connection.
       if (retryAfter <= RATE_LIMIT_ABSORB_MAX_SECONDS && retryCount < maxRetries) {
         console.log(`[TeamClaude] Rate-limit 429 on "${account.name}" — waiting ${retryAfter}s, retrying same account (no switch)`);
-        emitProvenance(ctx, {
-          _account: account,
-          final: false,
-          outcome: 'rate-429-inline-wait',
-          response_status: 429,
-          attempt: ctx.attempt,
-          timings: {
-            admit_ms: admitMs,
-            headers_ms: ctx.attemptRec.headers_ms,
-            total_ms: Date.now() - attemptStartedAt,
-          },
-        });
         await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
         if (res.destroyed) {
           emitProvenance(ctx, {

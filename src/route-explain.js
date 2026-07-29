@@ -354,7 +354,7 @@ function buildFallback(candidates, accountCount, pinned) {
     chain,
     rules: [
       `a quota-rejection 429 (anthropic-ratelimit-unified-*-status: rejected) throttles the account and retries the request on the next candidate, up to ${accountCount} attempt(s) — one per account (server.js:704-737, maxRetries = account count at :525)`,
-      'a transient rate-limit 429 does NOT rotate: the same account is paused and retried, because moving the burst just throttles the next account too (issue #84, server.js:766-776)',
+      'a transient rate-limit 429 pauses and retries the same account by default (issue #84); after transient429RotateAfter consecutive hits on that account (default 3; 0 = never) it cools the account down and rotates to the next eligible candidate (R1)',
       'a transport/stream failure also fails over to the next candidate for this request only, without sidelining the account (server.js:864-866)',
       'any non-429 response — including the 404 an unknown model id earns — is relayed to the client verbatim with no retry and no rotation (server.js:794-807)',
       'a /tc-acct pinned request never fails over at all (server.js:542-552)',
@@ -517,7 +517,7 @@ function buildExplanation(trace) {
     out.push(upstreamSentence(first));
     const next = trace.candidates[1];
     if (next) {
-      out.push(`If that account's quota is rejected with a 429 it is throttled and the request is retried on "${next.name}"${next.rewritten ? `, where modelMap rewrites the id to "${next.upstreamModel}"` : ''}; a transient rate-limit 429 instead pauses and retries the same account.`);
+      out.push(`If that account's quota is rejected with a 429 it is throttled and the request is retried on "${next.name}"${next.rewritten ? `, where modelMap rewrites the id to "${next.upstreamModel}"` : ''}; a transient rate-limit 429 pauses and retries the same account, then rotates after transient429RotateAfter consecutive hits (default 3).`);
     } else {
       out.push('There is no second eligible account, so a quota rejection has nowhere to fail over to and the client receives the 429.');
     }

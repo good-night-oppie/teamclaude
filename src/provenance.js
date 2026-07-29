@@ -41,6 +41,8 @@ export const PROVENANCE_OUTCOMES = Object.freeze([
   'quota-429-rotate',
   'rate-429-inline-wait',
   'rate-429-surfaced',
+  // R1: consecutive transient-429 cap exhausted → cooldown + rotate (non-final).
+  'transient-429-cap',
   'transport-error',
   'client-disconnect',
   'stream-idle-timeout',

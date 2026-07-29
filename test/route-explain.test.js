@@ -219,8 +219,8 @@ test('the fallback chain is the candidate order, bounded by one attempt per acco
   assert.deepEqual(trace.fallback.chain, ['alice', 'bob', 'fugu']);
   assert.equal(trace.fallback.maxRetries, 4, 'maxRetries is the account count, disabled ones included');
   assert.equal(trace.fallback.pinned, false);
-  assert.ok(trace.fallback.rules.some(r => /does NOT rotate/.test(r)),
-    'a transient rate-limit 429 retries the same account — that must be stated');
+  assert.ok(trace.fallback.rules.some(r => /transient429RotateAfter/.test(r)),
+    'transient-429 cap-then-rotate (R1) must be stated in fallback rules');
   assert.ok(trace.fallback.rules.some(r => /non-429/.test(r)),
     'a 404 for an unknown model id is relayed verbatim with no failover');
 });
