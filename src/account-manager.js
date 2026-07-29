@@ -47,6 +47,17 @@ function emptyQuota() {
   };
 }
 
+// R2: optional per-account client-side token budget. Absent/invalid ⇒ null
+// (zero-config-inert). The sliding window that consumes this lives only in
+// memory — intentionally excluded from exportQuotaState / restoreQuotaState.
+function normalizeTokenBudget(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const windowSec = Number(raw.windowSec);
+  const maxTokens = Number(raw.maxTokens);
+  if (!(windowSec > 0) || !(maxTokens > 0)) return null;
+  return { windowSec, maxTokens };
+}
+
 // Build a fresh in-memory account record from a config/disk account object.
 // Shared by the constructor and addAccount() so the field set can never drift
 // between startup accounts and runtime-added ones (a divergence here once left
@@ -99,6 +110,10 @@ function makeAccount(acct, index) {
       totalRequests: 0,
       lastUsed: null,
     },
+    // R2 client-side budget (config-shaped). tokenWindow is ephemeral — dies
+    // with the process; never persisted across restarts.
+    tokenBudget: normalizeTokenBudget(acct.tokenBudget),
+    tokenWindow: [],
     rateLimitedUntil: null,
     throttledAt: null,
     // Storm control (see admit/release): in-flight upstream requests and the
@@ -895,6 +910,8 @@ export class AccountManager {
     // bucket that governs this model, so a spent Fable/Sonnet bucket bars just
     // that family — the account still serves every other model normally.
     if (this._isNearQuota(account, model)) return false;
+    // R2: optional client-side sliding token budget (accounts with no quota API).
+    if (this._isTokenBudgetTripped(account)) return false;
 
     // Route/ownership restriction: a configured route can pin a model pattern to
     // an exclusive set of accounts; failing that, a per-account `models` claim
@@ -927,7 +944,7 @@ export class AccountManager {
    * Compact machine reason why `account` is not serveable for `model`.
    * Closed enum derived from the same state `_isAvailable` reads — no new
    * bookkeeping. Returns null when the account is serveable.
-   *   quota-exhausted | circuit-open | probe-held | disabled |
+   *   quota-exhausted | token-budget | circuit-open | probe-held | disabled |
    *   token-expired | route-excluded | not-accepted
    */
   _unavailableReason(account, model = null, advisorModel = null) {
@@ -944,6 +961,7 @@ export class AccountManager {
     }
     if (account.upstream && circuitProbeClaimFresh(account)) return 'probe-held';
     if (this._isNearQuota(account, model)) return 'quota-exhausted';
+    if (this._isTokenBudgetTripped(account)) return 'token-budget';
     if (model && !this._routeAllows(account, model)) return 'route-excluded';
     if (model && !this._acceptsModel(account, model)) return 'not-accepted';
     if (advisorModel) {
@@ -981,6 +999,8 @@ export class AccountManager {
       const t = typeof q.resetsAt === 'number' ? q.resetsAt : new Date(q.resetsAt).getTime();
       if (Number.isFinite(t) && t > now) candidates.push(t);
     }
+    const budgetReset = this._tokenBudgetResetMs(account);
+    if (budgetReset != null && budgetReset > now) candidates.push(budgetReset);
     if (!candidates.length) return null;
     return Math.min(...candidates);
   }
@@ -988,14 +1008,15 @@ export class AccountManager {
   /**
    * ISO reset time for status/serveable, or null when unknown / not throttled.
    * "Not throttled" means the account is not currently constrained by a
-   * rate-limit hold, exhausted status, or near-quota utilization.
+   * rate-limit hold, exhausted status, near-quota utilization, or R2 token budget.
    */
   _quotaResetAt(account, model = null) {
     if (!account) return null;
     const held = account.status === 'throttled' && account.rateLimitedUntil
       && Date.now() < account.rateLimitedUntil;
     const constrained = held || account.status === 'exhausted'
-      || this._isNearQuota(account, model);
+      || this._isNearQuota(account, model)
+      || this._isTokenBudgetTripped(account);
     if (!constrained) return null;
     const ms = this._soonestResetMs(account, model);
     return ms != null ? new Date(ms).toISOString() : null;
@@ -1744,6 +1765,59 @@ export class AccountManager {
     if (!account) return;
     if (inputTokens) account.usage.totalInputTokens += inputTokens;
     if (outputTokens) account.usage.totalOutputTokens += outputTokens;
+  }
+
+  /** Drop sliding-window entries older than tokenBudget.windowSec. */
+  _pruneTokenWindow(account, now = Date.now()) {
+    if (!account?.tokenBudget || !account.tokenWindow?.length) return;
+    const cutoff = now - account.tokenBudget.windowSec * 1000;
+    while (account.tokenWindow.length && account.tokenWindow[0].ts < cutoff) {
+      account.tokenWindow.shift();
+    }
+  }
+
+  _tokenWindowSum(account, now = Date.now()) {
+    this._pruneTokenWindow(account, now);
+    if (!account.tokenWindow?.length) return 0;
+    let sum = 0;
+    for (const e of account.tokenWindow) sum += e.tokens;
+    return sum;
+  }
+
+  /** True when an optional R2 tokenBudget window is at/over maxTokens. */
+  _isTokenBudgetTripped(account) {
+    if (!account?.tokenBudget) return false;
+    return this._tokenWindowSum(account) >= account.tokenBudget.maxTokens;
+  }
+
+  /**
+   * ms timestamp when the oldest window entry rolls off (admission retry-after /
+   * quotaResetAt). null when the budget is absent or not currently tripped.
+   */
+  _tokenBudgetResetMs(account) {
+    if (!account?.tokenBudget) return null;
+    this._pruneTokenWindow(account);
+    if (!account.tokenWindow.length) return null;
+    if (this._tokenWindowSum(account) < account.tokenBudget.maxTokens) return null;
+    return account.tokenWindow[0].ts + account.tokenBudget.windowSec * 1000;
+  }
+
+  /**
+   * R2: record one completed response's already-parsed usage into the sliding
+   * window. No-op when tokenBudget is unset (zero-config-inert). Ephemeral —
+   * the window is never written to disk.
+   */
+  recordTokenBudget(accountIndex, usage) {
+    const account = this.accounts[accountIndex];
+    if (!account?.tokenBudget || !usage) return;
+    const input = Number(usage.input);
+    const output = Number(usage.output);
+    const tokens = (Number.isFinite(input) ? input : 0)
+      + (Number.isFinite(output) ? output : 0);
+    if (tokens <= 0) return;
+    const now = Date.now();
+    account.tokenWindow.push({ ts: now, tokens });
+    this._pruneTokenWindow(account, now);
   }
 
   /**

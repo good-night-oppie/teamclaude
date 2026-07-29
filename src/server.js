@@ -684,7 +684,7 @@ export function createProxyRequestListener({
       if (pinnedIndex == null && accountManager.accounts.length
           && !accountManager.accounts.some(a => accountManager._isAvailable(a, model, null))) {
         const CAPACITY = new Set([
-          'quota-exhausted', 'circuit-open', 'probe-held', 'disabled', 'token-expired',
+          'quota-exhausted', 'token-budget', 'circuit-open', 'probe-held', 'disabled', 'token-expired',
         ]);
         const reasons = accountManager.accounts.map(a => ({
           name: a.name,
@@ -1609,6 +1609,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         pathClass: ctx.pathClass,
       }, ctx.attemptRec);
       l?.end();
+      // R2: sliding-window budget from already-parsed attempt usage (no re-parse).
+      accountManager.recordTokenBudget(account.index, ctx.attemptRec.usage);
       const outcome = res.destroyed ? 'client-disconnect' : relayOutcome;
       emitProvenance(ctx, {
         _account: account,
@@ -1635,6 +1637,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const l = getLog();
       if (l) { l.body('RESPONSE BODY', buf, contentType); l.end(); }
       res.end(buf);
+      // R2: sliding-window budget from already-parsed attempt usage (no re-parse).
+      accountManager.recordTokenBudget(account.index, ctx.attemptRec.usage);
       emitProvenance(ctx, {
         _account: account,
         final: true,
