@@ -140,6 +140,32 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
         return;
       }
 
+      // D2: shadow decision evidence ring — pure read, allowlisted fields.
+      // Default limit = ring capacity (R0 lesson: smaller default hid newest half).
+      if (req.method === 'GET' && (req.url === '/teamclaude/shadow-decisions'
+          || (req.url || '').startsWith('/teamclaude/shadow-decisions?'))) {
+        let limit;
+        try {
+          const u = new URL(req.url, 'http://localhost');
+          const limRaw = u.searchParams.get('limit');
+          if (limRaw != null && limRaw !== '') {
+            const lim = Number(limRaw);
+            if (Number.isFinite(lim) && lim > 0) limit = lim;
+          }
+        } catch { /* keep default = full ring */ }
+        const snap = accountManager.getShadowDecisions(
+          limit == null ? {} : { limit },
+        );
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          now: new Date().toISOString(),
+          capacity: snap.capacity,
+          size: snap.size,
+          decisions: snap.decisions,
+        }, null, 2));
+        return;
+      }
+
       // T7 provenance poll — pure read (copied slice; no cursor mutation).
       // Consumers reset their cursor when boot_epoch changes; head_seq < cursor
       // is a ring-overwrite hint only, not restart detection.

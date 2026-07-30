@@ -17,6 +17,52 @@ export { isFableModel, parseRequestModel, parseAdvisorModel } from './model.js';
 // recovers on the next request rather than staying stuck.
 const FORCED_REFRESH_FLOOR_MS = 10_000;
 
+/** D2: bounded shadow-decision evidence ring (T7 pattern). Ephemeral. */
+export const SHADOW_DECISION_RING_SIZE = 512;
+
+/** Allowlist-by-construction — no tokens/keys (T7 privacy discipline). */
+export const SHADOW_DECISION_SAFE_FIELDS = Object.freeze([
+  'ts', 'model', 'legacy', 'dynamic', 'changed', 'reason',
+  'legacyEvidence', 'dynamicEvidence', 'dynamicPickServeable',
+]);
+
+/** rank-replay `evidence()` field shape — account name + rank signals only. */
+export const SHADOW_EVIDENCE_SAFE_FIELDS = Object.freeze([
+  'account', 'routeTier', 'accountCostTier', 'priority',
+  'weeklyReset', 'sessionReset', 'utilization',
+  'status', 'circuitOpenUntil', 'mappedTo',
+]);
+
+const SHADOW_REASON_STAGES = Object.freeze([
+  'tier', 'weekly', 'session', 'utilization', 'priority', 'equal',
+]);
+
+function emptyReasonHistogram() {
+  return Object.fromEntries(SHADOW_REASON_STAGES.map(s => [s, 0]));
+}
+
+function copyShadowEvidence(e) {
+  if (!e) return null;
+  const out = {};
+  for (const k of SHADOW_EVIDENCE_SAFE_FIELDS) out[k] = e[k] ?? null;
+  return out;
+}
+
+function copyShadowDecision(rec) {
+  if (!rec) return null;
+  return {
+    ts: rec.ts ?? null,
+    model: rec.model ?? null,
+    legacy: rec.legacy ?? null,
+    dynamic: rec.dynamic ?? null,
+    changed: !!rec.changed,
+    reason: rec.reason ?? null,
+    legacyEvidence: copyShadowEvidence(rec.legacyEvidence),
+    dynamicEvidence: copyShadowEvidence(rec.dynamicEvidence),
+    dynamicPickServeable: !!rec.dynamicPickServeable,
+  };
+}
+
 // Quota fields that survive a restart: utilization levels and their reset
 // windows, learned passively from upstream responses. Transient/derived state
 // (probing, requalify, rateLimitedUntil) is intentionally excluded.
@@ -228,6 +274,10 @@ export class AccountManager {
     this._dynamicCurrentByKey = new Map();
     this._dynamicEvalAtByKey = new Map();
     this._shadowDecisions = { total: 0, changed: 0, last: null };
+    // D2: process-lifetime evidence ring (not persisted — like T7).
+    this._shadowRing = new Array(SHADOW_DECISION_RING_SIZE);
+    this._shadowRingPushed = 0;
+    this._shadowReasonHistogram = emptyReasonHistogram();
     // Count of advisor strip-and-degrade events (blocked / pin-unservable /
     // unmapped). Visible on GET /teamclaude/status so the degrade is never silent.
     this._advisorDegrades = 0;
@@ -1557,15 +1607,76 @@ export class AccountManager {
     return 0;
   }
 
-  _recordShadowDecision(legacy, dynamic, model) {
-    this._shadowDecisions.total += 1;
-    if (!legacy || !dynamic || legacy.index === dynamic.index) return;
-    this._shadowDecisions.changed += 1;
-    const signature = `${model || '<default>'}:${legacy.name}->${dynamic.name}`;
-    if (this._shadowDecisions.last !== signature) {
-      this._shadowDecisions.last = signature;
-      console.log(`[TeamClaude] SHADOW routing model="${model || '<default>'}": legacy="${legacy.name}" dynamic="${dynamic.name}"`);
+  /** rank-replay `evidence()` shape — safe fields only (no credentials). */
+  _rankEvidence(account, model, now = Date.now()) {
+    if (!account) return null;
+    const weeklyReset = this._completeWeeklyReset(account, model, now);
+    const sessionReset = this._completeSessionReset(account, now);
+    const utilization = this._dynamicUtilization(account, model);
+    return {
+      account: account.name,
+      routeTier: this._costTierFor(account, model),
+      accountCostTier: account.costTier,
+      priority: account.priority || 0,
+      weeklyReset: Number.isFinite(weeklyReset) ? weeklyReset : null,
+      sessionReset: Number.isFinite(sessionReset) ? sessionReset : null,
+      utilization: Number.isFinite(utilization) ? utilization : null,
+      status: account.status,
+      circuitOpenUntil: account.circuitOpenUntil || null,
+      mappedTo: account.modelMap?.[model] || null,
+    };
+  }
+
+  /** First differing dynamicCompare stage between two picks. */
+  _shadowDiffReason(legacy, dynamic, model, now = Date.now()) {
+    if (!legacy || !dynamic || legacy.index === dynamic.index) return 'equal';
+    if (this._costTierFor(legacy, model) !== this._costTierFor(dynamic, model)) return 'tier';
+    if (this._completeWeeklyReset(legacy, model, now)
+      !== this._completeWeeklyReset(dynamic, model, now)) return 'weekly';
+    if (this._completeSessionReset(legacy, now)
+      !== this._completeSessionReset(dynamic, now)) return 'session';
+    if (this._dynamicUtilization(legacy, model)
+      !== this._dynamicUtilization(dynamic, model)) return 'utilization';
+    if ((legacy.priority || 0) !== (dynamic.priority || 0)) return 'priority';
+    return 'equal';
+  }
+
+  _pushShadowDecision(record) {
+    this._shadowRing[this._shadowRingPushed % SHADOW_DECISION_RING_SIZE] = record;
+    this._shadowRingPushed += 1;
+    if (Object.hasOwn(this._shadowReasonHistogram, record.reason)) {
+      this._shadowReasonHistogram[record.reason] += 1;
     }
+  }
+
+  _recordShadowDecision(legacy, dynamic, model, advisorModel = null) {
+    this._shadowDecisions.total += 1;
+    const changed = !!(legacy && dynamic && legacy.index !== dynamic.index);
+    if (changed) {
+      this._shadowDecisions.changed += 1;
+      const signature = `${model || '<default>'}:${legacy.name}->${dynamic.name}`;
+      if (this._shadowDecisions.last !== signature) {
+        this._shadowDecisions.last = signature;
+        console.log(`[TeamClaude] SHADOW routing model="${model || '<default>'}": legacy="${legacy.name}" dynamic="${dynamic.name}"`);
+      }
+    }
+    const now = Date.now();
+    const reason = this._shadowDiffReason(legacy, dynamic, model, now);
+    // Allowlist-by-construction: named fields only (T7 privacy discipline).
+    const record = {
+      ts: new Date(now).toISOString(),
+      model: model == null ? null : String(model),
+      legacy: legacy?.name ?? null,
+      dynamic: dynamic?.name ?? null,
+      changed,
+      reason,
+      legacyEvidence: this._rankEvidence(legacy, model, now),
+      dynamicEvidence: this._rankEvidence(dynamic, model, now),
+      dynamicPickServeable: dynamic
+        ? this._isAvailable(dynamic, model, advisorModel)
+        : false,
+    };
+    this._pushShadowDecision(record);
   }
 
   /** Compare legacy vs dynamic winners for THIS request and record evidence.
@@ -1577,7 +1688,42 @@ export class AccountManager {
     if (!eligible.length) return;
     const legacy = [...eligible].sort((a, b) => this._legacyCompare(a, b, model))[0];
     const dynamic = [...eligible].sort((a, b) => this.dynamicCompare(a, b, model))[0];
-    this._recordShadowDecision(legacy, dynamic, model);
+    this._recordShadowDecision(legacy, dynamic, model, advisorModel);
+  }
+
+  /**
+   * Pure read of the shadow-decision ring. Default limit = ring capacity so a
+   * naked poll cannot omit the newest half (R0 lesson on provenance).
+   */
+  getShadowDecisions({ limit } = {}) {
+    const capacity = SHADOW_DECISION_RING_SIZE;
+    const retained = Math.min(this._shadowRingPushed, capacity);
+    let lim = retained;
+    if (limit != null && limit !== '') {
+      const n = Number(limit);
+      if (Number.isFinite(n) && n > 0) lim = Math.min(n, retained);
+    }
+    const start = this._shadowRingPushed < capacity
+      ? 0
+      : this._shadowRingPushed - capacity;
+    const decisions = [];
+    for (let i = 0; i < retained && decisions.length < lim; i++) {
+      const slot = this._shadowRing[(start + i) % capacity];
+      decisions.push(copyShadowDecision(slot));
+    }
+    return { capacity, size: retained, decisions };
+  }
+
+  _shadowDecisionsStatus() {
+    const { total, changed, last } = this._shadowDecisions;
+    return {
+      total,
+      changed,
+      last,
+      ringSize: Math.min(this._shadowRingPushed, SHADOW_DECISION_RING_SIZE),
+      changedRate: total > 0 ? changed / total : 0,
+      reasonHistogram: { ...this._shadowReasonHistogram },
+    };
   }
 
   /**
@@ -1599,7 +1745,12 @@ export class AccountManager {
   }
 
   exportShadowDecisions() {
-    return { ...this._shadowDecisions };
+    // Counters only — the D2 evidence ring is process-lifetime (like T7).
+    return {
+      total: this._shadowDecisions.total,
+      changed: this._shadowDecisions.changed,
+      last: this._shadowDecisions.last,
+    };
   }
 
   restoreShadowDecisions(saved) {
@@ -1607,6 +1758,7 @@ export class AccountManager {
     this._shadowDecisions.total = Number.isFinite(saved.total) ? saved.total : 0;
     this._shadowDecisions.changed = Number.isFinite(saved.changed) ? saved.changed : 0;
     this._shadowDecisions.last = saved.last ?? null;
+    // Ring + histogram stay ephemeral; a restart begins a fresh evidence window.
   }
 
   /**
@@ -2130,7 +2282,7 @@ export class AccountManager {
       currentAccount: this.accounts[this.currentIndex]?.name,
       switchThreshold: this.switchThreshold,
       routingPolicy: { ...this.routingPolicy },
-      shadowDecisions: { ...this._shadowDecisions },
+      shadowDecisions: this._shadowDecisionsStatus(),
       advisorDegrades: this._advisorDegrades,
       rotationGate: this.rotationLedger.statusSnapshot(this.rotationGate.mode),
       routes: this.getRoutes(),
