@@ -263,10 +263,16 @@ test('D2: endpoint field allowlist + naked GET returns full ring (R0 class)', as
       `http://127.0.0.1:${port}/teamclaude/shadow-decisions?limit=256`,
     )).json();
     assert.equal(capped.decisions.length, 256);
-    assert.ok(
-      capped.decisions.at(-1).model !== 'claude-opus-4-8',
-      'explicit small limit still returns oldest half (R0 illusion class)',
+    // R0 illusion class, explicit-limit path: an operator polling ?limit=N mid
+    // incident must see the NEWEST N decisions. Returning the oldest N showed a
+    // frozen evidence window while push() kept admitting.
+    assert.equal(
+      capped.decisions.at(-1).model,
+      'claude-opus-4-8',
+      'explicit limit must return the newest window, not the oldest',
     );
+    // ...and the window must start after the trimmed-off prefix, not at slot 0.
+    assert.equal(capped.decisions[0].model, 'fill-45');
 
     // Status summary present.
     const st = await (await fetch(`http://127.0.0.1:${port}/teamclaude/status`)).json();

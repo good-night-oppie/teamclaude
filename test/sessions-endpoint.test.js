@@ -121,7 +121,10 @@ test('building the sessions payload does not alter selection for an active sessi
     at: clock.t, pathClass: 'messages', model: 'claude-sonnet-4', account: 'b',
   });
   st.noteUsage('s-pin', 'claude-sonnet-4', 50_000, { at: clock.t });
-  const payload = am.getSessions({ now: clock.t });
+  // getSessions(config, now) — the clock is the SECOND argument. Passing
+  // { now } as the first left `now` defaulting to Date.now(), so the fixed
+  // clock was ignored and the snapshot was taken against real time.
+  const payload = am.getSessions({}, clock.t);
   assert.ok(payload.sessions.some(s => s.session_id === 's-pin'));
 
   assert.equal(st.pinnedAccount('s-pin', clock.t), beforePin, 'pin unchanged after payload build');

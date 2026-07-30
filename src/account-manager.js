@@ -1694,6 +1694,12 @@ export class AccountManager {
   /**
    * Pure read of the shadow-decision ring. Default limit = ring capacity so a
    * naked poll cannot omit the newest half (R0 lesson on provenance).
+   *
+   * An explicit `limit` selects the NEWEST `limit` decisions, not the oldest.
+   * Walking forward from the oldest surviving slot reproduced the R0 illusion
+   * on the explicit-limit path: an operator polling `?limit=50` during a live
+   * incident saw a frozen window of stale evidence while push() kept admitting.
+   * Returned order stays chronological (oldest -> newest) within the window.
    */
   getShadowDecisions({ limit } = {}) {
     const capacity = SHADOW_DECISION_RING_SIZE;
@@ -1703,12 +1709,11 @@ export class AccountManager {
       const n = Number(limit);
       if (Number.isFinite(n) && n > 0) lim = Math.min(n, retained);
     }
-    const start = this._shadowRingPushed < capacity
-      ? 0
-      : this._shadowRingPushed - capacity;
+    // Absolute index of the first slot in the NEWEST `lim`-sized window.
+    const first = this._shadowRingPushed - lim;
     const decisions = [];
-    for (let i = 0; i < retained && decisions.length < lim; i++) {
-      const slot = this._shadowRing[(start + i) % capacity];
+    for (let i = 0; i < lim; i++) {
+      const slot = this._shadowRing[(first + i) % capacity];
       decisions.push(copyShadowDecision(slot));
     }
     return { capacity, size: retained, decisions };

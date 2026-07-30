@@ -24,7 +24,9 @@ ProtectHome=read-only
 ReadWritePaths=%h/.config %h/.teamclaude %h/.local/state
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 LockPersonality=true
-MemoryDenyWriteExecute=true
+# NO MemoryDenyWriteExecute here: ExecStart is the Node CLI, and MDWE blocks
+# V8's writable->executable JIT transitions, so the process can fail to start.
+# The rest of the hardening set above applies to a JIT runtime without issue.
 
 [Install]
 WantedBy=default.target
