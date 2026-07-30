@@ -287,6 +287,11 @@ export class AccountManager {
     // that becomes ineligible is skipped — routing falls back to best-available.
     this.routePins = new Map();
     this.switchThreshold = switchThreshold;
+    // D7/B55: sticky "deployment declared routes". Once true, an empty table
+    // (e.g. index.js `diskConfig.routes || []` wiping on a partial reload) must
+    // FAIL CLOSED rather than reopen every account via _accountOwnsModel.
+    // Legacy no-routes configs leave this false forever → ownership unchanged.
+    this._routesConfigured = false;
     this.setRoutes(routes);
     // Storm control: when rotation switches to a fresh account, a burst of
     // in-flight requests (e.g. dozens of agents failing over together) would all
@@ -1175,6 +1180,9 @@ export class AccountManager {
         color: r.color || null,
       };
     }).filter(r => r.match.length);
+    // Sticky: a non-empty normalized table arms fail-closed for the process life.
+    // Clearing via setRoutes([]) (reload wipe) must NOT disarm — that is B55.
+    if (this.routes.length > 0) this._routesConfigured = true;
     // Drop pins for routes that no longer exist after a reload.
     if (this.routePins?.size) {
       const names = new Set(this.routes.map(r => r.name));
@@ -1203,8 +1211,24 @@ export class AccountManager {
   /** Whether `account` may serve `model`. A matching route with an `accounts`
    * list is exclusive (only listed accounts, by name or index). With no matching
    * route — or a route that lists no accounts — it falls back to the per-account
-   * `models` ownership claim (deprecated — use `routes` instead). */
+   * `models` ownership claim (deprecated — use `routes` instead).
+   *
+   * D7/B55: `_accountOwnsModel` is reachable ONLY when the deployment never
+   * declared routes. With routes configured, the dangerous entrances that make
+   * `_routeForModel` return null without a real "no glob matched" decision
+   * (null/unparseable model, empty-after-load table) FAIL CLOSED here — guard
+   * the fallback, not each caller. Unmatched model ids with a live non-empty
+   * table still use ownership (that is not an entrance to the B47/B55 hole). */
   _routeAllows(account, model) {
+    // Empty-table entrance: sticky flag set, table wiped → never ownership.
+    if (this._routesConfigured && !this.routes?.length) return false;
+    // Null-model entrance: with routes configured, exclusivity is not advisory.
+    // Call sites that still gate on `if (model && …)` skip this for status reads;
+    // the inference-path refuse lives in server.js (path-aware half).
+    if (!model) {
+      if (this._routesConfigured) return false;
+      return this._accountOwnsModel(account, model);
+    }
     const route = this._routeForModel(model);
     if (route && route.accounts.length) {
       return route.accounts.includes(account.name) || route.accounts.includes(String(account.index));

@@ -44,6 +44,13 @@ export function isSemanticSessionRequest(method, url) {
   return cls === 'messages' || cls === 'count_tokens';
 }
 
+/** D7 path-aware half: inference = `/v1/messages` and any `/v1/messages/…` subpath.
+ * Non-inference (e.g. `/api/eval/sdk-*`) must not regress on null-model traffic. */
+export function isInferencePath(url) {
+  const path = (url || '').split('?')[0];
+  return path === '/v1/messages' || path.startsWith('/v1/messages/');
+}
+
 const SESSIONS_ABSENT = {
   awaiting_permission:
     'unobservable at proxy: client-side dialog, no request in flight — indistinguishable from idle; see client_hint seam',
@@ -279,17 +286,36 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
       // Reload endpoint — re-sync accounts from config without a restart. This
       // is the headless equivalent of pressing 'R' in the TUI. Local control
       // only (no upstream calls); the auth gate above already applies.
+      // D7: emit one config-reload provenance control event (routing-authority
+      // change must be visible in the evidence stream).
       if (req.method === 'POST' && req.url === '/teamclaude/reload') {
+        const emitReload = (responseStatus, errCode = null) => {
+          if (!provenance) return;
+          provenance.push({
+            request_id: provenance.nextRequestId('b'),
+            attempt: 0,
+            final: true,
+            outcome: 'config-reload',
+            method: 'POST',
+            path: '/teamclaude/reload',
+            response_status: responseStatus,
+            err_code: errCode,
+            pinned: false,
+          });
+        };
         if (!hooks.reload) {
+          emitReload(501);
           res.writeHead(501, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: 'reload not supported' }));
           return;
         }
         try {
           const added = await hooks.reload();
+          emitReload(200);
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: true, added: added || 0 }));
         } catch (err) {
+          emitReload(500, err?.code != null ? String(err.code) : null);
           res.writeHead(500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: err.message }));
         }
@@ -618,6 +644,27 @@ export function createProxyRequestListener({
           pinned: pinnedIndex != null,
         });
       };
+
+      // D7 path-aware null-model refuse: with a configured route table, inference
+      // paths must not fall through to _accountOwnsModel (B47). Non-inference
+      // paths (e.g. /api/eval/sdk-*) keep today's null-model behavior.
+      if (!model && pinnedIndex == null && accountManager._routesConfigured
+          && isInferencePath(req.url)) {
+        const message = 'Routed inference requires a model id — refusing null/unparseable model while a route table is configured.';
+        if (!res.headersSent) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            type: 'error',
+            error: { type: 'invalid_request_error', message },
+          }));
+        }
+        hooks.onRequestEnd?.(reqId, {
+          method: req.method, path: req.url, account: '(route-fail-closed)',
+          status: 400, model: null, sessionId,
+        });
+        emitGate('rejected-null-model', { response_status: 400, account: '(route-fail-closed)' });
+        return;
+      }
 
       // Model blocklist (issue #116): reject when the EXECUTOR id is blocked.
       // An advisor-only hit strip-and-degrades (G9): never 400 the executor turn

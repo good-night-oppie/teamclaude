@@ -60,6 +60,10 @@ export const PROVENANCE_OUTCOMES = Object.freeze([
   'reauth-401-retry',
   // D3: ingress stripped foreign thinking/redacted_thinking before Anthropic egress.
   'thinking-stripped',
+  // D7: POST /teamclaude/reload control event (routing-authority change).
+  'config-reload',
+  // D7: inference path refused a null/unparseable model under a configured route table.
+  'rejected-null-model',
 ]);
 
 const SAFE_SET = new Set(PROVENANCE_SAFE_FIELDS);
