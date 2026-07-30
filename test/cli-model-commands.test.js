@@ -353,10 +353,19 @@ test('env TC_ACCT validation uses the same UUID/qualified resolver as the server
     for (const pin of ['acct-deepseek', 'org-deepseek', 'acct-deepseek/org-deepseek']) {
       const r = runWithEnv({ TC_ACCT: pin }, 'env', '--no-mitm');
       assert.equal(r.status, 0, r.stderr);
-      assert.doesNotMatch(r.stderr, /warning: no account named/,
+      assert.doesNotMatch(r.stderr, /warning: unknown account pin/,
         `valid TC_ACCT pin ${pin} must not emit a false warning`);
       assert.match(r.stderr, new RegExp(`pinned to account "${pin.replace('/', '\\/')}"`));
     }
+  });
+});
+
+test('env TC_ACCT still warns on a genuinely unknown pin', async () => {
+  await withCli(async ({ runWithEnv }) => {
+    const r = runWithEnv({ TC_ACCT: 'not-a-real-pin' }, 'env', '--no-mitm');
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stderr, /warning: unknown account pin "not-a-real-pin"/,
+      'the eval-safe warn-not-fail path must still fire for a pin that resolves to nothing');
   });
 });
 
