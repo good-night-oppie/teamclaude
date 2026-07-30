@@ -474,6 +474,9 @@ function emitProvenance(ctx, fields) {
     err_code: fields.err_code ?? null,
     final: !!fields.final,
     count: fields.count,
+    // D8: same pin bit already on hooks.onRequestStart/End — never recompute from URL
+    // (prefix is stripped before most emit sites run). forcedPin OR's into pinnedIndex.
+    pinned: ctx.pinnedIndex != null,
   });
 }
 
@@ -612,6 +615,7 @@ export function createProxyRequestListener({
           final: true,
           outcome,
           ...extra,
+          pinned: pinnedIndex != null,
         });
       };
 

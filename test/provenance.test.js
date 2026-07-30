@@ -515,3 +515,216 @@ test('streaming message_start populates response_reported_model', async () => {
     await close(upstream);
   }
 });
+
+// ── D8: pinned boolean on every provenance event ───────────────────────────
+
+test('D8: buildProvenanceEvent allowlists pinned bool (default false)', () => {
+  assert.ok(PROVENANCE_SAFE_FIELDS.includes('pinned'));
+  const withPin = buildProvenanceEvent({
+    request_id: 'x-b-1', attempt: 1, final: true, outcome: 'ok', pinned: true,
+  }, { seq: 1, ts: '2026-01-01T00:00:00.000Z' });
+  assert.equal(withPin.pinned, true);
+  const without = buildProvenanceEvent({
+    request_id: 'x-b-2', attempt: 1, final: true, outcome: 'ok',
+  }, { seq: 2, ts: '2026-01-01T00:00:00.000Z' });
+  assert.equal(without.pinned, false);
+  assert.deepEqual(Object.keys(withPin).sort(), [...PROVENANCE_SAFE_FIELDS].sort());
+});
+
+test('D8: /tc-acct/ pin → every provenance event has pinned:true; normal → false', async () => {
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      id: 'msg_1', type: 'message', role: 'assistant', model: 'm',
+      content: [], usage: { input_tokens: 1, output_tokens: 1 },
+    }));
+  });
+  const upPort = await listen(upstream);
+  const am = new AccountManager([oauth('alpha'), oauth('beta')]);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upPort}`,
+  });
+  const port = await listen(proxy);
+  try {
+    const pinnedRes = await fetch(`http://127.0.0.1:${port}/tc-acct/alpha/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'm', messages: [] }),
+    });
+    assert.equal(pinnedRes.status, 200);
+    await pinnedRes.text();
+
+    const normalRes = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'm', messages: [{ role: 'user', content: 'n' }] }),
+    });
+    assert.equal(normalRes.status, 200);
+    await normalRes.text();
+
+    const prov = await (await fetch(`http://127.0.0.1:${port}/teamclaude/provenance`)).json();
+    assert.ok(prov.events.length >= 2);
+    for (const e of prov.events) {
+      assert.equal(typeof e.pinned, 'boolean', `seq ${e.seq} missing pinned bool`);
+    }
+    // First request was /tc-acct/alpha → every event on that request_id is pinned.
+    const pinnedFinal = prov.events.find(e => e.final && e.account === 'alpha' && e.attempt >= 1);
+    assert.ok(pinnedFinal);
+    const pinnedChain = prov.events.filter(e => e.request_id === pinnedFinal.request_id);
+    for (const e of pinnedChain) assert.equal(e.pinned, true);
+
+    // Second (unprefixed) request → pinned:false on every event.
+    const unpinnedFinal = prov.events.find(e => e.final && e.request_id !== pinnedFinal.request_id);
+    assert.ok(unpinnedFinal, 'normal request must emit a final event');
+    const unpinnedChain = prov.events.filter(e => e.request_id === unpinnedFinal.request_id);
+    for (const e of unpinnedChain) assert.equal(e.pinned, false);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('D8: pinned-unavailable failure carries pinned:true', async () => {
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(500, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: 'boom' } }));
+  });
+  const upPort = await listen(upstream);
+  const am = new AccountManager([
+    { name: 'solo', type: 'apikey', apiKey: 'k', upstream: `http://127.0.0.1:${upPort}` },
+  ]);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upPort}`,
+  });
+  const port = await listen(proxy);
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/tc-acct/solo/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'm', messages: [] }),
+    });
+    assert.equal(res.status, 429);
+    await res.text();
+
+    const prov = await (await fetch(`http://127.0.0.1:${port}/teamclaude/provenance`)).json();
+    const fail = prov.events.find(e => e.outcome === 'pinned-unavailable');
+    assert.ok(fail, `expected pinned-unavailable, got ${prov.events.map(e => e.outcome).join(',')}`);
+    assert.equal(fail.pinned, true);
+    assert.equal(fail.final, true);
+    // Non-final attempt before the terminal must carry the same pin bit.
+    const prior = prov.events.filter(e => e.request_id === fail.request_id && !e.final);
+    assert.ok(prior.length >= 1);
+    for (const e of prior) assert.equal(e.pinned, true);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('D8: non-final 429-wait + final share the same pinned value', async () => {
+  let hits = 0;
+  const upstream = http.createServer((_req, res) => {
+    hits++;
+    if (hits === 1) {
+      res.writeHead(429, { 'retry-after': '1', 'content-type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error' } }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      id: 'msg_1', type: 'message', role: 'assistant', model: 'm',
+      content: [], usage: { input_tokens: 1, output_tokens: 1 },
+    }));
+  });
+  const upPort = await listen(upstream);
+  const am = new AccountManager([
+    { name: 'sakana', type: 'apikey', apiKey: 'k', upstream: `http://127.0.0.1:${upPort}` },
+  ]);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upPort}`,
+  });
+  const port = await listen(proxy);
+  try {
+    const pinnedRes = await fetch(`http://127.0.0.1:${port}/tc-acct/sakana/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'm', messages: [] }),
+    });
+    assert.equal(pinnedRes.status, 200);
+    await pinnedRes.text();
+
+    const normalRes = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'm', messages: [{ role: 'user', content: 'later' }] }),
+    });
+    assert.equal(normalRes.status, 200);
+    await normalRes.text();
+
+    const prov = await (await fetch(
+      `http://127.0.0.1:${port}/teamclaude/provenance?limit=512`,
+    )).json();
+
+    const pinnedWaits = prov.events.filter(e => e.outcome === 'rate-429-inline-wait' && e.pinned === true);
+    assert.ok(pinnedWaits.length >= 1, 'pinned 429-wait must emit pinned:true');
+    const pinnedRid = pinnedWaits[0].request_id;
+    const pinnedChain = prov.events.filter(e => e.request_id === pinnedRid);
+    assert.ok(pinnedChain.some(e => e.final));
+    for (const e of pinnedChain) assert.equal(e.pinned, true);
+
+    // A later unpinned request that also hit wait (hits already >1 → may be ok-only)
+    // still proves false on its finals.
+    const unpinnedFinals = prov.events.filter(e => e.final && e.pinned === false);
+    assert.ok(unpinnedFinals.length >= 1);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('D8: pinned survives ProvenanceBuffer snapshot and GET /teamclaude/provenance', async () => {
+  const buf = new ProvenanceBuffer({ size: 8 });
+  buf.push({
+    request_id: 'ep-b-1', attempt: 1, final: true, outcome: 'ok',
+    path: '/v1/messages', pinned: true,
+  });
+  const snap = buf.snapshot(0, 10);
+  assert.equal(snap.events.length, 1);
+  assert.equal(snap.events[0].pinned, true);
+  // Mutating the snapshot copy must not corrupt the ring.
+  snap.events[0].pinned = false;
+  assert.equal(buf.snapshot(0, 10).events[0].pinned, true);
+
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      id: 'msg_1', type: 'message', role: 'assistant', model: 'm',
+      content: [], usage: { input_tokens: 1, output_tokens: 1 },
+    }));
+  });
+  const upPort = await listen(upstream);
+  const am = new AccountManager([oauth('alpha')]);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upPort}`,
+  });
+  const port = await listen(proxy);
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/tc-acct/alpha/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'm', messages: [] }),
+    });
+    assert.equal(res.status, 200);
+    await res.text();
+    const body = await (await fetch(`http://127.0.0.1:${port}/teamclaude/provenance`)).json();
+    assert.ok(body.events.every(e => e.pinned === true));
+    assert.ok(body.events.every(e => Object.prototype.hasOwnProperty.call(e, 'pinned')));
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});

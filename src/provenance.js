@@ -35,6 +35,8 @@ export const PROVENANCE_SAFE_FIELDS = Object.freeze([
   'log_file',
   // D3: thinking-stripped non-final events carry how many blocks were dropped.
   'count',
+  // D8: request was forced onto one account via /tc-acct or MITM forcedPin.
+  'pinned',
 ]);
 
 export const PROVENANCE_OUTCOMES = Object.freeze([
@@ -134,6 +136,7 @@ export function buildProvenanceEvent(fields, { seq, ts }) {
     stream: !!src.stream,
     log_file: src.log_file == null ? null : basename(String(src.log_file)),
     count: Number.isFinite(src.count) ? src.count : null,
+    pinned: !!src.pinned,
   };
   // Tripwire: drop anything that slipped past the named assign above.
   for (const k of Object.keys(evt)) {
