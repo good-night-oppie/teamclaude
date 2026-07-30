@@ -1473,20 +1473,34 @@ export class AccountManager {
 
   /** Complete session/reset signal. Unified 5h is preferred; standard token or
    * request quotas can use `resetsAt` only when a corresponding limit pair is
-   * complete. Unknown ranks at Infinity, never as "0% used". */
+   * complete. When no header signal qualifies, a configured tokenBudget with a
+   * NON-EMPTY window synthesizes the R2 roll-off time (oldest ts + windowSec).
+   * Empty window = no evidence = Infinity (honesty: absence must not outrank
+   * unknowns). Unknown ranks at Infinity, never as "0% used". */
   _completeSessionReset(account, now = Date.now()) {
     const q = account.quota;
     if (q.unified5h != null && q.unified5hReset && q.unified5hReset > now) return q.unified5hReset;
     const standardComplete = (q.tokensLimit != null && q.tokensRemaining != null)
       || (q.requestsLimit != null && q.requestsRemaining != null);
-    if (!standardComplete || !q.resetsAt) return Infinity;
-    const t = typeof q.resetsAt === 'number' ? q.resetsAt : new Date(q.resetsAt).getTime();
-    return Number.isFinite(t) && t > now ? t : Infinity;
+    if (standardComplete && q.resetsAt) {
+      const t = typeof q.resetsAt === 'number' ? q.resetsAt : new Date(q.resetsAt).getTime();
+      if (Number.isFinite(t) && t > now) return t;
+    }
+    // D1: budgeted apikey synthetic expiry (zero-config-inert without tokenBudget).
+    if (account.tokenBudget) {
+      this._pruneTokenWindow(account, now);
+      if (account.tokenWindow?.length) {
+        return account.tokenWindow[0].ts + account.tokenBudget.windowSec * 1000;
+      }
+    }
+    return Infinity;
   }
 
   /** Utilization used only after reset timing ties. Lower first: with the same
    * expiry, drain the account with more capacity remaining. Unknown is Infinity
-   * so an opaque paid backend cannot masquerade as pristine quota. */
+   * so an opaque paid backend cannot masquerade as pristine quota. When
+   * tokenBudget is set and the window is non-empty, windowSum/maxTokens joins
+   * the max-of-signals set (D1). */
   _dynamicUtilization(account, model) {
     const q = account.quota;
     const vals = [];
@@ -1498,6 +1512,12 @@ export class AccountManager {
     }
     if (q.requestsLimit != null && q.requestsRemaining != null && q.requestsLimit > 0) {
       vals.push(1 - q.requestsRemaining / q.requestsLimit);
+    }
+    if (account.tokenBudget && account.tokenBudget.maxTokens > 0) {
+      const sum = this._tokenWindowSum(account);
+      if (account.tokenWindow?.length) {
+        vals.push(sum / account.tokenBudget.maxTokens);
+      }
     }
     return vals.length ? Math.max(...vals) : Infinity;
   }
