@@ -7,6 +7,8 @@ import { join } from 'node:path';
 import { ensureCerts, createConnectHandler } from './mitm.js';
 import { patchAccountUuid } from './account-uuid-rewrite.js';
 import { sanitizeToolPairs } from './tool-pair-sanitize.js';
+import { shouldStripForeignThinking, stripThinkingBlocks } from './thinking-strip.js';
+import { resolveHistoryFamily } from './rotation-ledger.js';
 import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
 import { TopLevelFieldFinder, stripAdvisorModelField } from './model.js';
 import { requestModelIds, blockedIdInSet, collisionIdInSet } from './model-namespace.js';
@@ -26,6 +28,7 @@ registerBuildFeature('quota-admission-gate');
 registerBuildFeature('sessions-endpoint');
 registerBuildFeature('provenance-t7');
 registerBuildFeature('rotation-gate');
+registerBuildFeature('ingress-thinking-strip');
 
 /** Path class for T5 last_request / ctx gating. */
 export function classifySessionPath(url) {
@@ -470,6 +473,7 @@ function emitProvenance(ctx, fields) {
     outcome: fields.outcome,
     err_code: fields.err_code ?? null,
     final: !!fields.final,
+    count: fields.count,
   });
 }
 
@@ -757,6 +761,8 @@ export function createProxyRequestListener({
       const transient429RotateAfter = rotateRaw === undefined || rotateRaw === null
         ? 3
         : Math.max(0, Number(rotateRaw) || 0);
+      // D3: zero-config-inert — only an explicit true enables foreign-thinking strip.
+      const ingressThinkingStrip = config?.ingressThinkingStrip === true;
       const ctx = {
         account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel,
         pinnedIndex, holdBudgetMs: holdMs, sessionId, pathClass, semantic,
@@ -774,6 +780,7 @@ export function createProxyRequestListener({
         attemptRec: null,
         transient429RotateAfter,
         transient429Counts: new Map(),
+        ingressThinkingStrip,
       };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
@@ -1195,6 +1202,30 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // 400 ("tool_use ids were found without tool_result blocks"). No-op (same
   // Buffer) for a well-formed body.
   let sendBody = sanitizeToolPairs(body, req.url, req.headers['content-type']);
+  // D3: when rotating onto Anthropic after a foreign family served this
+  // session, drop thinking/redacted_thinking so Anthropic does not 400 on
+  // foreign signatures. Ledger-based; empty ledger ⇒ inert.
+  if (ctx.ingressThinkingStrip) {
+    const targetFamily = account.historyFamily || resolveHistoryFamily(account);
+    const servedFamilies = accountManager.rotationLedger?.familiesOf(ctx.sessionId) || [];
+    if (shouldStripForeignThinking({
+      enabled: true,
+      targetFamily,
+      servedFamilies,
+    })) {
+      const stripped = stripThinkingBlocks(sendBody, req.url, req.headers['content-type']);
+      if (stripped.count > 0) {
+        sendBody = stripped.body;
+        emitProvenance(ctx, {
+          _account: account,
+          final: false,
+          outcome: 'thinking-stripped',
+          count: stripped.count,
+          attempt: ctx.attempt || 0,
+        });
+      }
+    }
+  }
   // Align the body's account_uuid (in metadata.user_id) with the account whose
   // token we're injecting (same-length patch; no-op if absent).
   if (account.accountUuid) sendBody = patchAccountUuid(sendBody, account.accountUuid);

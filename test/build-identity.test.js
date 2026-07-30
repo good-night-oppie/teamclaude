@@ -21,6 +21,7 @@ const EXPECTED_FEATURES = [
   'audit-b1-b6',
   'dynamic-routing',
   'ingress-collision-gate',
+  'ingress-thinking-strip',
   'model-preflight',
   'provenance-t7',
   'quota-admission-gate',

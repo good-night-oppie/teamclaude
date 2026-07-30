@@ -33,6 +33,8 @@ export const PROVENANCE_SAFE_FIELDS = Object.freeze([
   'timings',
   'stream',
   'log_file',
+  // D3: thinking-stripped non-final events carry how many blocks were dropped.
+  'count',
 ]);
 
 export const PROVENANCE_OUTCOMES = Object.freeze([
@@ -54,6 +56,8 @@ export const PROVENANCE_OUTCOMES = Object.freeze([
   'upstream-error-relayed',
   // Upstream #136: OAuth 401 forced-refresh retry (non-final; a new egress follows).
   'reauth-401-retry',
+  // D3: ingress stripped foreign thinking/redacted_thinking before Anthropic egress.
+  'thinking-stripped',
 ]);
 
 const SAFE_SET = new Set(PROVENANCE_SAFE_FIELDS);
@@ -129,6 +133,7 @@ export function buildProvenanceEvent(fields, { seq, ts }) {
     timings: sanitizeTimings(src.timings),
     stream: !!src.stream,
     log_file: src.log_file == null ? null : basename(String(src.log_file)),
+    count: Number.isFinite(src.count) ? src.count : null,
   };
   // Tripwire: drop anything that slipped past the named assign above.
   for (const k of Object.keys(evt)) {
