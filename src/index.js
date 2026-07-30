@@ -6,7 +6,7 @@ import { createWriteStream, readFileSync } from 'node:fs';
 import net from 'node:net';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, loadState, saveState } from './config.js';
 import { AccountManager } from './account-manager.js';
-import { createProxyServer } from './server.js';
+import { createProxyServer, resolveAccountPin } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import { sameIdentity, orgKey, matchAccounts } from './identity.js';
 import { resolveAccounts } from './resolve-accounts.js';
@@ -726,9 +726,10 @@ async function envCommand() {
     } else {
       process.stderr.write(`# pinned to account "${account}" (TC_ACCT)\n`);
       // Warn, don't fail: the account list can change before the shell is used,
-      // and this command must stay eval-safe.
-      if (!(config.accounts || []).some((a, i) => a.name === account || String(i) === account)) {
-        process.stderr.write(`# warning: no account named "${account}" in the config — the proxy will refuse this pin\n`);
+      // and this command must stay eval-safe. Use the SAME resolver as TC_ACCT's
+      // server path; a valid UUID/qualified pin is not necessarily a name.
+      if (resolveConfigAccountPin(config, account) == null) {
+        process.stderr.write(`# warning: unknown account pin "${account}" — the proxy will refuse this pin\n`);
       }
     }
   }
@@ -947,6 +948,17 @@ async function runCommand() {
 // path segment (resolveAccountPin, server.js:148-156): exact name first, then
 // numeric index. Exits non-zero with the valid NAMES on no match — names only,
 // never a token, key, or email-derived credential.
+// Config-file adapter for the LIVE server's resolveAccountPin (server.js):
+// accepts a plain config object, not a running AccountManager, so the CLI can
+// share the exact same pin-matching contract (accountUuid/orgUuid, accountUuid,
+// orgUuid, display name, display name minus " (Org)") without a socket, a
+// server instance, or a second implementation to keep in sync. Deliberately
+// does NOT accept a numeric rotation index — TC_ACCT never has, because array
+// position is unstable identity (test/account-pin.test.js documents why).
+function resolveConfigAccountPin(config, token) {
+  return resolveAccountPin({ accounts: config.accounts || [] }, token);
+}
+
 function resolveRunAccountPin(config, token) {
   const accounts = config.accounts || [];
   const names = accounts.map(a => a.name);
@@ -955,20 +967,15 @@ function resolveRunAccountPin(config, token) {
     console.error(names.length
       ? `Valid accounts: ${names.join(', ')}`
       : 'No accounts are configured. Add one with: teamclaude login');
-    console.error('Or address one by index: --account 0 (same order as: teamclaude accounts)');
+    console.error('Accepted pin forms: accountUuid/orgUuid, accountUuid, orgUuid, or display name/email.');
     process.exit(1);
   };
 
-  if (!token) bail('--account needs an account name or index, e.g. --account work');
+  if (!token) bail('--account needs an account pin, e.g. --account work');
 
-  const byName = accounts.findIndex(a => a.name === token);
-  if (byName >= 0) return { token, index: byName, name: accounts[byName].name };
-  if (/^\d+$/.test(token)) {
-    const i = Number(token);
-    if (i >= 0 && i < accounts.length) return { token, index: i, name: accounts[i].name };
-    bail(`--account ${token}: index out of range (${accounts.length} account(s) configured).`);
-  }
-  bail(`No account named "${token}".`);
+  const index = resolveConfigAccountPin(config, token);
+  if (index == null) bail(`Unknown account pin "${token}".`);
+  return { token, index, name: accounts[index].name };
 }
 
 // The fail-loud launch check. Reads Claude Code's settings tiers READ-ONLY and

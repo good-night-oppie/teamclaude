@@ -22,9 +22,13 @@ const CLI = join(dirname(fileURLToPath(import.meta.url)), '..', 'src', 'index.js
 const FIXTURE = {
   proxy: { port: 39999, apiKey: 'fixture' },
   accounts: [
-    { name: 'primary', type: 'oauth', priority: 0 },
+    {
+      name: 'primary', type: 'oauth', priority: 0,
+      accountUuid: 'acct-primary', orgUuid: 'org-primary',
+    },
     {
       name: 'deepseek-v4-pro', type: 'apikey', apiKey: 'k', priority: 80,
+      accountUuid: 'acct-deepseek', orgUuid: 'org-deepseek',
       upstream: 'http://127.0.0.1:8084',
       modelMap: { 'claude-opus-4-8': 'deepseek-v4-pro', 'claude-fable-5': 'deepseek-v4-pro' },
     },
@@ -45,14 +49,21 @@ async function withCli(fn) {
 
   // cwd inside the tmpdir and CLAUDE_CONFIG_DIR pointed at it: no tier of the
   // real ~/.claude is reachable from here.
-  const run = (...argv) => spawnSync(process.execPath, [CLI, ...argv], {
+  const spawnCli = (argv, envPatch = {}) => spawnSync(process.execPath, [CLI, ...argv], {
     cwd: join(dir, 'work'),
     encoding: 'utf8',
-    env: { ...process.env, TEAMCLAUDE_CONFIG: configPath, CLAUDE_CONFIG_DIR: join(dir, 'work') },
+    env: {
+      ...process.env,
+      TEAMCLAUDE_CONFIG: configPath,
+      CLAUDE_CONFIG_DIR: join(dir, 'work'),
+      ...envPatch,
+    },
   });
+  const run = (...argv) => spawnCli(argv);
+  const runWithEnv = (envPatch, ...argv) => spawnCli(argv, envPatch);
 
   try {
-    await fn({ dir, configPath, settingsPath, run });
+    await fn({ dir, configPath, settingsPath, run, runWithEnv });
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -309,11 +320,51 @@ test('run --account is judged against the pinned account, not the routing table 
   });
 });
 
+test('run --account accepts every stable TC_ACCT identity form', async () => {
+  await withRun(async ({ run }) => {
+    const cases = [
+      ['acct-deepseek', 'accountUuid'],
+      ['org-deepseek', 'orgUuid'],
+      ['acct-deepseek/org-deepseek', 'qualified accountUuid/orgUuid'],
+      ['DEEPSEEK-V4-PRO', 'case-insensitive display name'],
+    ];
+    for (const [pin, form] of cases) {
+      const r = run('--account', pin, '--', '--model', 'claude-opus-4-8');
+      assert.ok(!r.stderr.includes('No account named'), `${form} must resolve: ${r.stderr}`);
+      assert.ok(!r.stderr.includes('Refusing to launch'), `${form} must reach pinned preflight: ${r.stderr}`);
+      assert.match(r.stderr, /WARNING: account "deepseek-v4-pro" is pinned/, form);
+      assert.match(r.stderr, /Proxy not running/, `${form} passed validation without touching a daemon`);
+    }
+  });
+});
+
+test('run --account rejects numeric rotation indexes because TC_ACCT does', async () => {
+  await withRun(async ({ run }) => {
+    const r = run('--account', '1', '--', '--model', 'claude-opus-4-8');
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /Unknown account pin "1"/);
+    assert.doesNotMatch(r.stderr, /index out of range|address one by index/,
+      'array position is unstable identity; deleting account 0 must not silently repoint pin 1');
+  });
+});
+
+test('env TC_ACCT validation uses the same UUID/qualified resolver as the server', async () => {
+  await withCli(async ({ runWithEnv }) => {
+    for (const pin of ['acct-deepseek', 'org-deepseek', 'acct-deepseek/org-deepseek']) {
+      const r = runWithEnv({ TC_ACCT: pin }, 'env', '--no-mitm');
+      assert.equal(r.status, 0, r.stderr);
+      assert.doesNotMatch(r.stderr, /warning: no account named/,
+        `valid TC_ACCT pin ${pin} must not emit a false warning`);
+      assert.match(r.stderr, new RegExp(`pinned to account "${pin.replace('/', '\\/')}"`));
+    }
+  });
+});
+
 test('run --account=<name> pins, and an unknown flag before the -- is refused instead of dropped', async () => {
   await withRun(async ({ run }) => {
     const eq = run('--account=nope', '--', '-p', 'hi');
     assert.equal(eq.status, 1);
-    assert.match(eq.stderr, /No account named "nope"/,
+    assert.match(eq.stderr, /Unknown account pin "nope"/,
       'the equals form used to parse as "no pin", launching an UNPINNED session in silence');
 
     const typo = run('--acount', 'primary', '--', '-p', 'hi');

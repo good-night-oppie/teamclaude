@@ -297,7 +297,15 @@ export function preflightModel({
   const requested = scan.effective || (typeof envModel === 'string' && envModel ? envModel : null);
   const source = scan.effective ? 'argv' : (requested ? 'ANTHROPIC_MODEL' : null);
   const findings = [];
-  const pinToken = accountPin?.token ?? accountPin?.name ?? null;
+  // Prefer the RESOLVED name over the raw pin token: the token may be a stable
+  // identity (accountUuid, orgUuid, accountUuid/orgUuid) that pinnedRoutabilityOf
+  // cannot match — model-namespace.js's normalizeAccounts() does not carry
+  // accountUuid/orgUuid, so its account lookup only matches by name or index.
+  // The caller (runCommand) already resolved the pin via the shared
+  // resolveAccountPin contract before constructing accountPin, so `.name` is
+  // always a valid account name here whenever `.token` was a UUID form; the
+  // resulting explain/remedy text is also copy-pasteable either way.
+  const pinToken = accountPin?.name ?? accountPin?.token ?? null;
 
   if (scan.duplicate) {
     const listed = scan.occurrences
