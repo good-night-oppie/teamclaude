@@ -20,6 +20,9 @@ const FORCED_REFRESH_FLOOR_MS = 10_000;
 /** D2: bounded shadow-decision evidence ring (T7 pattern). Ephemeral. */
 export const SHADOW_DECISION_RING_SIZE = 512;
 
+/** D9: defensive cap on provenance `skipped[]` (pathological route size). */
+export const SELECTION_SKIPPED_CAP = 8;
+
 /** Allowlist-by-construction — no tokens/keys (T7 privacy discipline). */
 export const SHADOW_DECISION_SAFE_FIELDS = Object.freeze([
   'ts', 'model', 'legacy', 'dynamic', 'changed', 'reason',
@@ -999,6 +1002,56 @@ export class AccountManager {
     }
 
     return true;
+  }
+
+  /**
+   * D9: compact selection-time skip evidence for provenance. Pure read — does
+   * not change ranking or eligibility. Only for routed models; pin bypasses
+   * selection so skipped is absent. Entries are route candidates that rank
+   * ahead of `selected` and fail `_isAvailable`, with the existing
+   * `_unavailableReason` string (no parallel taxonomy). Capped at
+   * SELECTION_SKIPPED_CAP; overflow counted in `skipped_more`.
+   *
+   * @returns {{ skipped: {a:string,r:string}[]|undefined, skipped_more: number|undefined }}
+   */
+  selectionSkippedAhead(selected, model, advisorModel = null, { pinned = false } = {}) {
+    if (pinned || !selected || !model) {
+      return { skipped: undefined, skipped_more: undefined };
+    }
+    const route = this._routeForModel(model);
+    if (!route) return { skipped: undefined, skipped_more: undefined };
+
+    const inRoute = (a) => !route.accounts.length
+      || route.accounts.includes(a.name)
+      || route.accounts.includes(String(a.index));
+    const candidates = this.accounts.filter(inRoute);
+    if (!candidates.some(a => a.index === selected.index)) {
+      return { skipped: undefined, skipped_more: undefined };
+    }
+
+    const dynamic = this.routingPolicy.mode === 'dynamic';
+    candidates.sort((a, b) => {
+      const c = dynamic
+        ? this.dynamicCompare(a, b, model)
+        : this._legacyCompare(a, b, model);
+      return c !== 0 ? c : a.index - b.index;
+    });
+
+    const ahead = [];
+    for (const a of candidates) {
+      if (a.index === selected.index) break;
+      // Available-but-unchosen (stickiness) is NOT a skip — only ineligibility.
+      const reason = this._unavailableReason(a, model, advisorModel);
+      if (reason) ahead.push({ a: a.name, r: reason });
+    }
+    if (!ahead.length) return { skipped: undefined, skipped_more: undefined };
+    if (ahead.length <= SELECTION_SKIPPED_CAP) {
+      return { skipped: ahead, skipped_more: undefined };
+    }
+    return {
+      skipped: ahead.slice(0, SELECTION_SKIPPED_CAP),
+      skipped_more: ahead.length - SELECTION_SKIPPED_CAP,
+    };
   }
 
   /**

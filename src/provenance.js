@@ -37,7 +37,25 @@ export const PROVENANCE_SAFE_FIELDS = Object.freeze([
   'count',
   // D8: request was forced onto one account via /tc-acct or MITM forcedPin.
   'pinned',
+  // D9: selection-time skips ranked ahead of the chosen account (routed models).
+  'skipped',
+  'skipped_more',
 ]);
+
+/** Defensive cap mirrored from account-manager SELECTION_SKIPPED_CAP. */
+const SKIPPED_CAP = 8;
+
+function sanitizeSkipped(v) {
+  if (!Array.isArray(v) || v.length === 0) return null;
+  const out = [];
+  for (const item of v) {
+    if (!item || typeof item !== 'object') continue;
+    if (item.a == null || item.r == null) continue;
+    out.push({ a: String(item.a), r: String(item.r) });
+    if (out.length >= SKIPPED_CAP) break;
+  }
+  return out.length ? out : null;
+}
 
 export const PROVENANCE_OUTCOMES = Object.freeze([
   'ok',
@@ -141,6 +159,10 @@ export function buildProvenanceEvent(fields, { seq, ts }) {
     log_file: src.log_file == null ? null : basename(String(src.log_file)),
     count: Number.isFinite(src.count) ? src.count : null,
     pinned: !!src.pinned,
+    skipped: sanitizeSkipped(src.skipped),
+    skipped_more: (Number.isFinite(src.skipped_more) && src.skipped_more > 0)
+      ? Math.floor(src.skipped_more)
+      : null,
   };
   // Tripwire: drop anything that slipped past the named assign above.
   for (const k of Object.keys(evt)) {
@@ -308,5 +330,9 @@ function copyEvent(evt) {
     ...evt,
     usage: evt.usage ? { ...evt.usage } : { input: null, output: null },
     timings: evt.timings ? { ...evt.timings } : { admit_ms: null, headers_ms: null, total_ms: null },
+    // D9: deep-copy skipped rows so snapshot mutation cannot corrupt the ring.
+    skipped: Array.isArray(evt.skipped)
+      ? evt.skipped.map(row => ({ a: row.a, r: row.r }))
+      : (evt.skipped ?? null),
   };
 }

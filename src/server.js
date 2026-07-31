@@ -525,6 +525,12 @@ function emitProvenance(ctx, fields) {
     // D8: same pin bit already on hooks.onRequestStart/End — never recompute from URL
     // (prefix is stripped before most emit sites run). forcedPin OR's into pinnedIndex.
     pinned: ctx.pinnedIndex != null,
+    // D9: selection-time skips (set once per attempt after getActiveAccount).
+    // Never invent here — pin / non-routed leave null. Not logged unbounded.
+    skipped: fields.skipped !== undefined ? fields.skipped : ctx.selectionSkipped,
+    skipped_more: fields.skipped_more !== undefined
+      ? fields.skipped_more
+      : ctx.selectionSkippedMore,
   });
 }
 
@@ -864,6 +870,9 @@ export function createProxyRequestListener({
         transient429RotateAfter,
         transient429Counts: new Map(),
         ingressThinkingStrip,
+        // D9: filled at selection; null means absent (pin / non-routed / none skipped).
+        selectionSkipped: null,
+        selectionSkippedMore: null,
       };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
@@ -1126,6 +1135,16 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   const account = ctx.pinnedIndex != null
     ? (ctx.tried.has(ctx.pinnedIndex) ? null : accountManager.accounts[ctx.pinnedIndex])
     : accountManager.getActiveAccount(ctx.tried, ctx.model, ctx.advisorModel, ctx.sessionId);
+  // D9: capture eligibility skips AT SELECTION TIME (pure read). Pin bypasses
+  // selection → leave null (pinned:true already explains). Does not alter pick.
+  if (account && ctx.pinnedIndex == null) {
+    const sk = accountManager.selectionSkippedAhead(account, ctx.model, ctx.advisorModel);
+    ctx.selectionSkipped = sk.skipped ?? null;
+    ctx.selectionSkippedMore = sk.skipped_more ?? null;
+  } else {
+    ctx.selectionSkipped = null;
+    ctx.selectionSkippedMore = null;
+  }
   if (!account) {
     // A pinned request concerns exactly one account: don't compute a fleet-wide
     // retry-after or sleep on other accounts' windows — return immediately.
