@@ -97,9 +97,9 @@ test('D4b: routingPolicy ABSENT on reload preserves running mode/affinity/reeval
     routingPolicy: mem.routingPolicy,
     rotationGate: mem.rotationGate,
   });
-  const before = structuredClone(am.routingPolicy);
-  const beforeGate = structuredClone(am.rotationGate);
-  const beforeRoutes = structuredClone(am.getRoutes());
+  const before = JSON.parse(JSON.stringify(am.routingPolicy));
+  const beforeGate = JSON.parse(JSON.stringify(am.rotationGate));
+  const beforeRoutes = JSON.parse(JSON.stringify(am.getRoutes()));
 
   // Disk omits routingPolicy / rotationGate / routes entirely (partial reload).
   applyTopLevelReload({ accounts: [apikey('a')] }, mem, am);
