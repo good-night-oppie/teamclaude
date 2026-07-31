@@ -585,18 +585,30 @@ test('D8: /tc-acct/ pin → every provenance event has pinned:true; normal → f
   }
 });
 
-test('D8: pinned-unavailable failure carries pinned:true', async () => {
-  const upstream = http.createServer((_req, res) => {
+// D11-T5 / D8: a pin must NOT rotate on custom-upstream 5xx. Pre-fix this
+// collapsed into a misleading 429 pinned-unavailable after tried.add + recurse.
+test('D8/D11: pinned custom-upstream 5xx relays the real status (not pinned-unavailable)', async () => {
+  let badHits = 0;
+  let goodHits = 0;
+  const bad = http.createServer((_req, res) => {
+    badHits++;
     res.writeHead(500, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: 'boom' } }));
   });
-  const upPort = await listen(upstream);
+  const good = http.createServer((_req, res) => {
+    goodHits++;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ id: 'ok', type: 'message', model: 'm' }));
+  });
+  const badPort = await listen(bad);
+  const goodPort = await listen(good);
   const am = new AccountManager([
-    { name: 'solo', type: 'apikey', apiKey: 'k', upstream: `http://127.0.0.1:${upPort}` },
+    { name: 'solo', type: 'apikey', apiKey: 'k', upstream: `http://127.0.0.1:${badPort}`, priority: 0 },
+    { name: 'other', type: 'apikey', apiKey: 'k2', upstream: `http://127.0.0.1:${goodPort}`, priority: 1 },
   ]);
   const proxy = createProxyServer(am, {
     proxy: { apiKey: 'k' },
-    upstream: `http://127.0.0.1:${upPort}`,
+    upstream: `http://127.0.0.1:${badPort}`,
   });
   const port = await listen(proxy);
   try {
@@ -605,21 +617,68 @@ test('D8: pinned-unavailable failure carries pinned:true', async () => {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ model: 'm', messages: [] }),
     });
-    assert.equal(res.status, 429);
+    assert.equal(res.status, 500, 'pin must surface the real upstream 5xx');
     await res.text();
+    assert.equal(badHits, 1);
+    assert.equal(goodHits, 0, 'pin must not rotate onto another account');
 
     const prov = await (await fetch(`http://127.0.0.1:${port}/teamclaude/provenance`)).json();
-    const fail = prov.events.find(e => e.outcome === 'pinned-unavailable');
-    assert.ok(fail, `expected pinned-unavailable, got ${prov.events.map(e => e.outcome).join(',')}`);
+    assert.ok(!prov.events.some(e => e.outcome === 'pinned-unavailable'),
+      'must not invent pinned-unavailable after a real upstream failure');
+    const fail = prov.events.find(e => e.final);
+    assert.ok(fail);
     assert.equal(fail.pinned, true);
-    assert.equal(fail.final, true);
-    // Non-final attempt before the terminal must carry the same pin bit.
-    const prior = prov.events.filter(e => e.request_id === fail.request_id && !e.final);
-    assert.ok(prior.length >= 1);
-    for (const e of prior) assert.equal(e.pinned, true);
+    assert.equal(fail.response_status, 500);
   } finally {
     await close(proxy);
-    await close(upstream);
+    await close(bad);
+    await close(good);
+  }
+});
+
+// D11-T5: custom-upstream ECONNREFUSED on a pin → typed 502, not 429 pinned-unavailable.
+test('D11: pinned custom-upstream ECONNREFUSED surfaces real transport error', async () => {
+  const unused = http.createServer();
+  const deadPort = await listen(unused);
+  await close(unused);
+
+  let goodHits = 0;
+  const good = http.createServer((_req, res) => {
+    goodHits++;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ id: 'ok', type: 'message', model: 'm' }));
+  });
+  const goodPort = await listen(good);
+  const am = new AccountManager([
+    { name: 'dead', type: 'apikey', apiKey: 'k1', upstream: `http://127.0.0.1:${deadPort}`, priority: 0 },
+    { name: 'good', type: 'apikey', apiKey: 'k2', upstream: `http://127.0.0.1:${goodPort}`, priority: 1 },
+  ]);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: 'http://invalid',
+  });
+  const port = await listen(proxy);
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/tc-acct/dead/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'm', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    assert.equal(res.status, 502, 'pin must surface typed 502 for ECONNREFUSED');
+    const body = await res.json();
+    assert.match(body.error?.message || '', /Upstream error/);
+    assert.equal(goodHits, 0, 'pin must not rotate onto good');
+
+    const prov = await (await fetch(`http://127.0.0.1:${port}/teamclaude/provenance`)).json();
+    assert.ok(!prov.events.some(e => e.outcome === 'pinned-unavailable'));
+    const fail = prov.events.find(e => e.final);
+    assert.ok(fail);
+    assert.equal(fail.pinned, true);
+    assert.equal(fail.response_status, 502);
+    assert.equal(fail.err_code, 'ECONNREFUSED');
+  } finally {
+    await close(proxy);
+    await close(good);
   }
 });
 

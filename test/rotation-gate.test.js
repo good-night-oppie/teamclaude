@@ -387,6 +387,54 @@ test('gate-blocked session gets typed 409 BEFORE holdBudget sleep (no lying 429)
   }
 });
 
+// D11-T4: gate refusal must emit exactly ONE terminal onRequestEnd (outer
+// lifecycle owns it; an inner call double-fired UI/provenance consumers).
+test('D11: rotation-gate refusal emits exactly one onRequestEnd', async () => {
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}');
+  });
+  const upPort = await listen(upstream);
+  const am = new AccountManager([
+    custom('kimi', `http://127.0.0.1:${upPort}`, { priority: 0 }),
+    custom('sakana', `http://127.0.0.1:${upPort}`, {
+      priority: 10, acceptsHistoryFamilies: ['anthropic', 'sakana'],
+    }),
+  ], 0.98);
+  am.noteServedFamily('poison-end', 0);
+  am.accounts[0].disabled = true;
+
+  const ends = [];
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upPort}`,
+  }, {
+    onRequestEnd: (id, info) => ends.push({ id, ...info }),
+  });
+  const port = await listen(proxy);
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': 'k',
+        'x-claude-code-session-id': 'poison-end',
+      },
+      body: JSON.stringify({
+        model: 'claude-opus-4-8', max_tokens: 16,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    assert.equal(res.status, 409);
+    assert.equal(ends.length, 1, `expected exactly one onRequestEnd, got ${ends.length}`);
+    assert.equal(ends[0].status, 409);
+    assert.equal(ends[0].account, '(history-gate)');
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
 // ── pins bypass ───────────────────────────────────────────────
 
 test('/tc-acct pin bypasses the rotation gate', async () => {

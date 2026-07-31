@@ -725,9 +725,19 @@ export function launchSummary(config, {
   }
 
   if (accountPin) {
-    const pin = pinnedRoutabilityOf(config, model, accountPin);
+    // Accept a resolved pin object ({ name, token }) or a bare token string.
+    // Callers that already resolved via resolveAccountPin (run's launch line)
+    // must pass `.name` so a UUID-form pin does not false-negative here —
+    // pinnedRoutabilityOf only matches name/index (normalizeAccounts drops uuids).
+    const pinToken = accountPin && typeof accountPin === 'object'
+      ? (accountPin.name || accountPin.token || null)
+      : accountPin;
+    const displayPin = typeof accountPin === 'object'
+      ? (accountPin.token || accountPin.name || pinToken)
+      : accountPin;
+    const pin = pinnedRoutabilityOf(config, model, pinToken);
     const acct = pin.account;
-    if (!acct) return `model ${id ?? '(client default)'} → pin "${accountPin}" matches NO account — every request 404s`;
+    if (!acct) return `model ${id ?? '(client default)'} → pin "${displayPin}" matches NO account — every request 404s`;
     const dest = acct.upstream || 'the Anthropic API';
     const as = pin.mappedTo ? ` as "${pin.mappedTo}"` : '';
     const outside = pin.outsideRouting ? ', outside the routing rules' : '';

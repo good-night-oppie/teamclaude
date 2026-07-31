@@ -1198,10 +1198,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
           error: { type: 'invalid_request_error', message: msg },
         }));
       }
-      hooks.onRequestEnd?.(reqId, {
-        method: req.method, path: req.url, account: '(history-gate)',
-        status: 409, model: ctx.model, sessionId: ctx.sessionId,
-      });
+      // Do NOT call hooks.onRequestEnd here — the request listener's `finally`
+      // owns the single terminal lifecycle event. An inner call double-fired
+      // provenance/UI consumers for every gate refusal.
       emitProvenance(ctx, {
         final: true, outcome: 'session-history-incompatible', response_status: 409,
         account: ctx.account, attempt: ctx.attempt || 0,
@@ -1271,7 +1270,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
 
   // Refresh OAuth token if needed
   await accountManager.ensureTokenFresh(account.index);
-  if (account.status === 'error' && retryCount < maxRetries) {
+  // A pin is an explicit bypass of rotation (D8): never rotate an errored pin
+  // onto another account — fall through and attempt (or surface) this one.
+  if (account.status === 'error' && retryCount < maxRetries && ctx.pinnedIndex == null) {
     accountManager.releaseCircuitProbe(account.index);
     ctx.tried.add(account.index);
     return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
@@ -1484,7 +1485,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       accountManager.noteProviderResult(account.index, {
         ok: false, status: upstreamRes.status, latencyMs: Date.now() - attemptStartedAt,
       });
-      if (retryCount < maxRetries && !res.headersSent) {
+      // D8/D11: a pin bypasses rotation — do not mark tried + recurse (that
+      // collapses into a misleading 429 pinned-unavailable). Relay the real 5xx.
+      if (retryCount < maxRetries && !res.headersSent && ctx.pinnedIndex == null) {
         await upstreamRes.body?.cancel();
         console.log(`[TeamClaude] Custom upstream ${upstreamRes.status} on "${account.name}" — circuit open, failing over`);
         emitProvenance(ctx, {
@@ -1502,7 +1505,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         ctx.tried.add(account.index);
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
       }
-      // Fall through: retries exhausted or headersSent — relay as upstream-error.
+      // Fall through: retries exhausted, pinned, or headersSent — relay as upstream-error.
     } else if (account.upstream) {
       // Reachable provider. A 4xx may be a bad request/model and remains
       // non-retryable, but it proves the adapter path itself is healthy.
@@ -1537,7 +1540,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const generalRejected = rl['anthropic-ratelimit-unified-5h-status'] === 'rejected'
         || rl['anthropic-ratelimit-unified-7d-status'] === 'rejected';
       const fableRejected = rl['anthropic-ratelimit-unified-7d_oi-status'] === 'rejected' && !generalRejected;
-      if ((generalRejected || fableRejected) && retryCount < maxRetries) {
+      // D8/D11: pin → never rotate; fall through to surface the real 429.
+      if ((generalRejected || fableRejected) && retryCount < maxRetries && ctx.pinnedIndex == null) {
         // A Fable-only rejection leaves the account fine for other models, so we
         // do NOT throttle it globally — the recorded Fable utilization makes
         // selection skip it for Fable requests only. A general rejection spends a
@@ -1609,7 +1613,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         timings: waitTimings,
       });
 
-      if (rotateAfter > 0 && consec >= rotateAfter && retryCount < maxRetries) {
+      // D8/D11: pin → never rotate onto another account.
+      if (rotateAfter > 0 && consec >= rotateAfter && retryCount < maxRetries && ctx.pinnedIndex == null) {
         const exclude = new Set(ctx.tried);
         exclude.add(account.index);
         const next = accountManager.getActiveAccount(
@@ -1849,7 +1854,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // Anthropic socket pool: open that account's circuit and try the next route
     // candidate before headers. Real Anthropic keeps the established destroy +
     // client-retry behavior below.
-    if (isTransient && account.upstream && retryCount < maxRetries && !res.headersSent) {
+    // D8/D11: pinned → never rotate; surface the real transport error below.
+    if (isTransient && account.upstream && retryCount < maxRetries && !res.headersSent
+        && ctx.pinnedIndex == null) {
       accountManager.noteProviderResult(account.index, { ok: false, error: err.message });
       emitProvenance(ctx, {
         _account: account,
@@ -1869,7 +1876,29 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // fast failure lets Node evict the dead socket so the retry reconnects
     // cleanly. If headers were already sent (a mid-stream body timeout), destroy
     // is the only option — the client sees a broken response and retries.
+    //
+    // Pinned custom-upstream transport failures are NOT a poisoned Anthropic
+    // pool: return a typed 502 naming the real error instead of destroy (or the
+    // pre-fix misleading 429 pinned-unavailable).
     if (isTransient) {
+      if (ctx.pinnedIndex != null && account.upstream && !res.headersSent && !res.destroyed) {
+        accountManager.noteProviderResult(account.index, { ok: false, error: err.message });
+        ctx.status = 502;
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'proxy_error', message: `Upstream error: ${err.message}` },
+        }));
+        emitProvenance(ctx, {
+          _account: account,
+          final: true,
+          outcome: errOutcome,
+          response_status: 502,
+          attempt: ctx.attempt || 0,
+          err_code: err?.code ?? null,
+        });
+        return;
+      }
       emitProvenance(ctx, {
         _account: account,
         final: true,
@@ -1886,7 +1915,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // *response*, never a throw. So don't sideline the account (that would drop
     // a healthy account from rotation until a credential change). Instead skip
     // it for the rest of THIS request only and fail over to another account.
-    if (retryCount < maxRetries && !res.headersSent) {
+    // D8/D11: pinned → never rotate; fall through to the typed 502 below.
+    if (retryCount < maxRetries && !res.headersSent && ctx.pinnedIndex == null) {
       emitProvenance(ctx, {
         _account: account,
         final: false,

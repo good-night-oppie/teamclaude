@@ -161,6 +161,33 @@ test('NODE_EXTRA_CA_CERTS is dropped with the proxy it belonged to, but not on i
   assert.deepEqual(alone.clear, [], 'nothing of ours was cleared, so the trust anchor is not ours to drop');
 });
 
+// D11-T1: BASE_URL-only match must not discard a corporate trust bundle.
+test('NODE_EXTRA_CA_CERTS survives when only ANTHROPIC_BASE_URL matched the dead port', () => {
+  const plan = directLaunchEnvPlan({
+    ANTHROPIC_BASE_URL: 'http://127.0.0.1:3456',
+    NODE_EXTRA_CA_CERTS: '/etc/ssl/corp-bundle.pem',
+  }, 3456);
+  assert.ok(plan.clear.includes('ANTHROPIC_BASE_URL'));
+  assert.ok(!plan.clear.includes('NODE_EXTRA_CA_CERTS'),
+    'a corporate CA is not teamclaude\'s MITM leaf — do not drop it on a base-URL-only match');
+});
+
+// D11-T2: teamclaude's own pinned MITM URL carries userinfo; both forms must clear.
+test('dead-port match tolerates userinfo URLs (pinned MITM form) and bare host form', () => {
+  const bare = 'http://127.0.0.1:3456';
+  const withUserinfo = 'http://fugu:secret@127.0.0.1:3456';
+  for (const value of [bare, withUserinfo]) {
+    const plan = directLaunchEnvPlan({ HTTPS_PROXY: value, NODE_EXTRA_CA_CERTS: '/tmp/ca.pem' }, 3456);
+    assert.ok(plan.clear.includes('HTTPS_PROXY'), `must clear proxy for ${value}`);
+    assert.ok(plan.clear.includes('NODE_EXTRA_CA_CERTS'), `MITM leaf drops with proxy for ${value}`);
+    assert.deepEqual(plan.remaining, [], value);
+  }
+  // userinfo on BASE_URL (unusual, but same host matcher) also clears.
+  const base = directLaunchEnvPlan(
+    { ANTHROPIC_BASE_URL: 'http://pin:key@127.0.0.1:3456/tc-acct/fugu' }, 3456);
+  assert.ok(base.clear.includes('ANTHROPIC_BASE_URL'));
+});
+
 test('directLaunchEnvPlan mutates nothing and tolerates junk', () => {
   const env = { HTTPS_PROXY: 'http://127.0.0.1:3456' };
   const before = JSON.stringify(env);

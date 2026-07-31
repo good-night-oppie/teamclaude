@@ -918,9 +918,12 @@ async function runCommand() {
   if (run.launchLine) {
     try {
       const model = scanModelArgs(claudeArgs).effective || process.env.ANTHROPIC_MODEL || null;
+      // Prefer the RESOLVED name (same as preflightModel): a UUID-form
+      // `--account` pin's raw token does not match normalizeAccounts()'s
+      // name/index lookup, which falsely printed "matches NO account".
       const line = launchSummary(config, {
         model,
-        accountPin: accountPin?.token || null,
+        accountPin: accountPin?.name || accountPin?.token || null,
         routingApplies: proxyUp,
         via: directLaunchVia,
       });

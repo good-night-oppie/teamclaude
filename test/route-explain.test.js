@@ -470,6 +470,32 @@ test('a pin that resolves to nothing is reported as a total failure, not as rout
   assert.match(line, /404/);
 });
 
+// D11-T3: UUID-form --account pin must use the resolved name (preflight already
+// does); a raw uuid token false-negatives against name/index-only lookup.
+test('uuid-form account pin produces a truthful launchSummary via resolved identity', () => {
+  const cfg = fixture();
+  cfg.accounts[2].accountUuid = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+  // Raw UUID token alone cannot resolve in pinnedRoutabilityOf (no uuid on
+  // normalizeAccounts) — same false "NO account" the launch line used to print.
+  const raw = launchSummary(cfg, {
+    model: FABLE,
+    accountPin: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+  });
+  assert.match(raw, /matches NO account/, 'raw uuid still cannot resolve without name');
+
+  // Resolved identity (what runCommand passes after resolveRunAccountPin):
+  const line = launchSummary(cfg, {
+    model: FABLE,
+    accountPin: {
+      token: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+      name: 'fugu',
+    },
+  });
+  assert.match(line, /PINNED account "fugu"/);
+  assert.equal(/matches NO account/.test(line), false);
+  assert.match(line, /no rotation, no failover/);
+});
+
 test('a direct launch refuses to describe teamclaude routing at all', () => {
   const line = launchSummary(fixture(), { model: FABLE, routingApplies: false });
   assert.match(line, /direct launch/);

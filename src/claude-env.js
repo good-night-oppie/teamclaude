@@ -98,7 +98,13 @@ const PROXY_VARS = ['HTTPS_PROXY', 'HTTP_PROXY', 'https_proxy', 'http_proxy'];
  */
 export function directLaunchEnvPlan(env, port) {
   const source = env && typeof env === 'object' ? env : {};
-  const ours = new RegExp(`^https?://(127\\.0\\.0\\.1|localhost|\\[::1\\]):${Number(port)}(/|$)`, 'i');
+  // Tolerate userinfo (`pin:key@host`) — teamclaude's own MITM pin URL is
+  // `http://<pin>:<key>@127.0.0.1:<port>`, and a regex that demands host
+  // immediately after `://` would leave our own pinned proxy var uncleared.
+  const ours = new RegExp(
+    `^https?://(?:[^/@]+@)?(127\\.0\\.0\\.1|localhost|\\[::1\\]):${Number(port)}(/|$)`,
+    'i',
+  );
 
   // `remaining` is grouped BY VALUE, not listed per variable. The four proxy
   // vars are conventionally set as one group to one URL — teamclaude's own MITM
@@ -120,8 +126,11 @@ export function directLaunchEnvPlan(env, port) {
 
   // Our MITM leaf is worthless to a direct launch and only matters alongside a
   // proxy we are clearing; drop it with them rather than leaving a dangling
-  // trust anchor, but only when we actually cleared a proxy var.
-  if (clear.length && typeof source.NODE_EXTRA_CA_CERTS === 'string' && source.NODE_EXTRA_CA_CERTS) {
+  // trust anchor. Gate on PROXY_VARS specifically — a BASE_URL-only match must
+  // not discard a corporate NODE_EXTRA_CA_CERTS trust bundle that has nothing
+  // to do with the dead teamclaude instance.
+  const clearedProxy = clear.some((name) => PROXY_VARS.includes(name));
+  if (clearedProxy && typeof source.NODE_EXTRA_CA_CERTS === 'string' && source.NODE_EXTRA_CA_CERTS) {
     clear.push('NODE_EXTRA_CA_CERTS');
   }
 
