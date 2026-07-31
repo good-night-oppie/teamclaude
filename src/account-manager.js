@@ -2213,6 +2213,10 @@ export class AccountManager {
     set('historyFamily', resolveHistoryFamily(disk));
     set('acceptsHistoryFamilies', Array.isArray(disk.acceptsHistoryFamilies)
       ? disk.acceptsHistoryFamilies.map(String) : null);
+    // R2 tokenBudget is config-shaped and must hot-reload with the rest of the
+    // policy set. The sliding tokenWindow stays ephemeral in memory — only the
+    // budget knobs move; counters are never persisted or reset here.
+    set('tokenBudget', normalizeTokenBudget(disk.tokenBudget));
     return changed;
   }
 
