@@ -141,7 +141,8 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
       // this way); forward anything else transparently instead of hijacking it.
       if (/^https?:\/\//i.test(req.url || '')) { relayHttpForward(req, res); return; }
 
-      // Status endpoint
+      // Status endpoint. B19: routes[] may include `tiers` (configured fallback
+      // structure). Field ABSENT when the route is untiered — not null, not [].
       if (req.method === 'GET' && req.url === '/teamclaude/status') {
         const status = accountManager.getStatus();
         const extra = hooks.getStatusExtra?.() || {};
@@ -212,7 +213,9 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
       // Executor id only — no body exists here; advisor-model callers pass the
       // executor id (or the advisor id when that is the decision they need).
       // Read-only: getServeable reuses pure _isAvailable (no breaker/probe/quota
-      // mutation).
+      // mutation). B19: account rows may include `routeTier` from
+      // AccountManager._costTierFor (same resolution as `rank`); omitted on
+      // untiered routes; Infinity → null + routeTierNote.
       if (req.method === 'GET' && (req.url === '/teamclaude/serveable'
           || (req.url || '').startsWith('/teamclaude/serveable?'))) {
         let model = null;

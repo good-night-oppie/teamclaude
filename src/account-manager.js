@@ -1143,6 +1143,12 @@ export class AccountManager {
    * that care about an advisor model must pass that id as `model` (or rely on
    * ingress, which quantifies over the full id set). Read-only: reuses the
    * pure `_isAvailable` path; never claims a probe slot or clears quota.
+   *
+   * B19 evidence: each account may gain `routeTier` resolved via `_costTierFor`
+   * (same semantics the `rank` CLI prints). Untiered routes omit the field;
+   * Infinity (account absent from every tier of a tiered route) serializes as
+   * `routeTier: null` + `routeTierNote: "untiered-on-tiered-route"` — JSON has
+   * no Infinity.
    */
   getServeable(model = null) {
     const accounts = this.accounts.map(a => {
@@ -1156,6 +1162,7 @@ export class AccountManager {
         const reason = this._unavailableReason(a, model);
         if (reason) row.reason = reason;
       }
+      Object.assign(row, this._routeTierEvidence(a, model));
       return row;
     });
     let soonestMs = Infinity;
@@ -1169,6 +1176,21 @@ export class AccountManager {
       accounts,
       soonestResetAt: soonestMs === Infinity ? null : new Date(soonestMs).toISOString(),
     };
+  }
+
+  /**
+   * JSON-safe route-tier evidence for HTTP surfaces. Calls `_costTierFor` —
+   * never re-implements tier resolution — so serveable/rank cannot disagree.
+   * Returns `{}` (caller omits) on untiered/no route; otherwise `{routeTier}`
+   * or `{routeTier:null, routeTierNote}` when the account is absent from every
+   * tier of a tiered route.
+   */
+  _routeTierEvidence(account, model) {
+    const route = this._routeForModel(model);
+    if (!route?.tiers?.length) return {};
+    const tier = this._costTierFor(account, model);
+    if (Number.isFinite(tier)) return { routeTier: tier };
+    return { routeTier: null, routeTierNote: 'untiered-on-tiered-route' };
   }
 
   /** Claim the half-open probe slot for a live request. Pure availability may
@@ -1315,13 +1337,25 @@ export class AccountManager {
    * carry `autocreated: true` and are never persisted — they simply surface the
    * per-model quota the server already respects. Each route lists the accounts it
    * can use with a live eligibility flag.
+   *
+   * B19 evidence: when a route has configured `tiers`, the entry includes
+   * `tiers: [{accounts:[...]}, ...]` (account lists only — the fallback
+   * structure auditors need). The `tiers` field is ABSENT for untiered routes
+   * (not null, not []) — absence means untiered.
    */
   getRoutes() {
-    const out = this.routes.map(r => ({
-      name: r.name, match: r.match, bucket: r.bucket, color: r.color || null, autocreated: false,
-      pinned: this._pinnedName(r.name),
-      accounts: this._routeAccountsView(r),
-    }));
+    const out = this.routes.map(r => {
+      const entry = {
+        name: r.name, match: r.match, bucket: r.bucket, color: r.color || null, autocreated: false,
+        pinned: this._pinnedName(r.name),
+        accounts: this._routeAccountsView(r),
+      };
+      // Absence = untiered. Do not emit null or [].
+      if (r.tiers?.length) {
+        entry.tiers = r.tiers.map(t => ({ accounts: [...t.accounts] }));
+      }
+      return entry;
+    });
 
     const detected = [];
     if (this.accounts.some(a => a.quota.unified7dFable != null)) {
