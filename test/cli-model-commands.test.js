@@ -1,7 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtemp, mkdir, writeFile, rm, readFile } from 'node:fs/promises';
+import { createServer } from 'node:http';
+import { mkdtemp, mkdir, writeFile, rm, readFile, chmod } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -429,5 +430,87 @@ test('D4e: `env --account` falls back to the display name only when no uuid exis
     // Single-quote wrap with internal-quote escaping: 'work'\''s desk'
     assert.match(r.stderr, /--account 'work'\\''s desk'/,
       'spaces/metacharacters in the suggested eval must be shell-quoted');
+  });
+});
+
+// ── run: stable pin emission parity with env (D4f) ────────────
+//
+// envCommand already emits stableAccountPin(); runCommand must too. A stub
+// listener makes isProxyUp true so the pin is written into the child env, and
+// a fake `claude` on PATH echoes ANTHROPIC_BASE_URL so we observe the emission
+// without a real daemon or Claude Code.
+
+async function withRunEmission(fn, configPatch = {}) {
+  const stub = createServer((_req, res) => { res.writeHead(204); res.end(); });
+  const port = await new Promise((resolve) => {
+    stub.listen(0, '127.0.0.1', () => resolve(stub.address().port));
+  });
+
+  const dir = await mkdtemp(join(tmpdir(), 'tc-cli-run-emit-'));
+  const binDir = join(dir, 'bin');
+  const workDir = join(dir, 'work');
+  const configPath = join(dir, 'teamclaude.json');
+  await mkdir(binDir, { recursive: true });
+  await mkdir(workDir, { recursive: true });
+  await writeFile(configPath, JSON.stringify({
+    ...runFixture(port),
+    ...configPatch,
+  }, null, 2));
+  await writeFile(join(workDir, 'settings.json'), JSON.stringify({ availableModels: ['claude-opus-4-8'] }));
+  const claudeShim = join(binDir, 'claude');
+  // Shebang uses this process's node: PATH is only binDir (so `claude` resolves
+  // to the shim), which would make `#!/usr/bin/env node` miss the real binary.
+  await writeFile(claudeShim,
+    `#!${process.execPath}\n`
+    + 'process.stdout.write(`ANTHROPIC_BASE_URL=${process.env.ANTHROPIC_BASE_URL || ""}\\n`);\n');
+  await chmod(claudeShim, 0o755);
+
+  const run = (...argv) => spawnSync(process.execPath, [CLI, 'run', ...argv], {
+    cwd: workDir,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      PATH: binDir,
+      TEAMCLAUDE_CONFIG: configPath,
+      CLAUDE_CONFIG_DIR: workDir,
+      TEAMCLAUDE_DISABLE_AUTOUPDATE: '1',
+      ANTHROPIC_MODEL: '',
+    },
+  });
+
+  try {
+    await fn({ dir, configPath, run, port });
+  } finally {
+    stub.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+test('D4f: `run --account` emits the uuid pin form, not the mutable display name', async () => {
+  await withRunEmission(async ({ run }) => {
+    const r = run('--no-mitm', '--account', 'primary', '--', '-p', 'hi');
+    assert.equal(r.status, 0, r.stderr);
+    // Same stable form env emits: accountUuid/orgUuid, percent-encoded in the path.
+    assert.match(r.stdout, /ANTHROPIC_BASE_URL=.*\/tc-acct\/acct-primary%2Forg-primary/,
+      'run must put the stable uuid pin into ANTHROPIC_BASE_URL for the child');
+    assert.match(r.stderr, /Pinned to account "acct-primary\/org-primary"/,
+      'stderr narration must report the emitted pin, not the display name');
+    assert.doesNotMatch(r.stderr, /Pinned to account "primary"/,
+      'display name must not be the emitted TC_ACCT when uuids exist');
+  });
+});
+
+test('D4f: `run --account` falls back to the display name only when no uuid exists', async () => {
+  await withRunEmission(async ({ run }) => {
+    const r = run('--no-mitm', '--account', "work's desk", '--', '-p', 'hi');
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /ANTHROPIC_BASE_URL=.*\/tc-acct\/work%27s%20desk/,
+      'name is the only identity; it must still appear (percent-encoded) in the child URL');
+    assert.match(r.stderr, /Pinned to account "work's desk"/);
+  }, {
+    accounts: [
+      { name: "work's desk", type: 'apikey', apiKey: 'k', priority: 0 },
+      ...FIXTURE.accounts,
+    ],
   });
 });

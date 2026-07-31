@@ -791,10 +791,11 @@ async function runCommand() {
   const port = config.proxy.port;
   const env = { ...process.env };
   // TC_ACCT is the sole pin mechanism. --account is sugar: it sets the pin
-  // identity (resolved to the account name so index sugar works — upstream
-  // resolveAccountPin rejects bare rotation indices). Deleted from the child
-  // env so it never leaks into tools/MCP servers claude spawns.
-  const tcAcct = (accountPin ? accountPin.name : (process.env.TC_ACCT || '')).trim();
+  // identity. Emit the STABLE form (uuid), not the mutable display name — same
+  // doctrine as envCommand / stableAccountPin — so a later rename cannot
+  // silently repoint a session. Deleted from the child env so it never leaks
+  // into tools/MCP servers claude spawns.
+  const tcAcct = (accountPin ? accountPin.pin : (process.env.TC_ACCT || '')).trim();
   delete env.TC_ACCT;
   // Legacy: a caller-supplied ANTHROPIC_BASE_URL of http://<this proxy>/tc-acct/…
   // also pins (shipped in 1.1.10). TC_ACCT is the supported way now — it works in
