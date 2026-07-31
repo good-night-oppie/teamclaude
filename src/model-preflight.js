@@ -425,25 +425,42 @@ export function preflightModel({
     }
 
     // Fold in the `--settings` tier sitting in the very argv being judged.
-    // Unreadable means UNKNOWN, and an unknown allowlist may not support a
-    // denial — the module's standing bias, restated where it actually bites.
+    // Unreadable usually means UNKNOWN, and an unknown allowlist may not
+    // support a denial — the module's standing bias. Exception: when a managed
+    // policy already settled the allowlist (`policyOverride`), the effective
+    // gate IS known; short-circuiting to "allowed" would silently ignore a file
+    // the user named. Fail that case loudly instead of proceeding without it.
     const flagTier = flagSettings || { present: false, entries: null, unreadable: false };
     if (flagTier.present && flagTier.unreadable) {
-      findings.push({
-        severity: 'info',
-        code: 'settings-flag-unread',
-        message: 'claude is being launched with --settings, which is a real settings tier whose availableModels union '
-          + 'in — but this one could not be read (not inline JSON, or unparseable), so the client-allowlist check was '
-          + 'skipped rather than guessed at.',
-        remedies: [],
-      });
+      if (policyOverride) {
+        findings.push({
+          severity: 'error',
+          code: 'settings-flag-unread',
+          message: 'claude is being launched with --settings, but that file (or inline JSON) could not be read, '
+            + 'and a managed policy has already replaced the availableModels union — proceeding would silently '
+            + 'drop a settings tier the user named.',
+          remedies: ['fix the --settings path (or pass inline JSON that parses)',
+            'or drop --settings and rely on the managed policy alone'],
+        });
+      } else {
+        findings.push({
+          severity: 'info',
+          code: 'settings-flag-unread',
+          message: 'claude is being launched with --settings, which is a real settings tier whose availableModels union '
+            + 'in — but this one could not be read (not inline JSON, or unparseable), so the client-allowlist check was '
+            + 'skipped rather than guessed at.',
+          remedies: [],
+        });
+      }
     }
     const effectiveAllowlist = flagTier.present && !flagTier.unreadable
       && Array.isArray(flagTier.entries) && !policyOverride
       ? [...new Set([...(Array.isArray(availableModels) ? availableModels : []), ...flagTier.entries])]
       : availableModels;
 
-    client = (flagTier.present && flagTier.unreadable)
+    // Under policyOverride the allowlist is already settled — still judge it.
+    // Only the unknown-allowlist case (unreadable, no policy) suppresses the veto.
+    client = (flagTier.present && flagTier.unreadable && !policyOverride)
       ? { allowed: true, reason: '--settings is present but unreadable, so the client gate cannot be modeled', matchedEntry: null }
       : clientAllowlistVerdict(effectiveAllowlist, requested);
     if (!client.allowed) {

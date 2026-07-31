@@ -449,6 +449,24 @@ test('an UNREADABLE --settings suppresses the veto rather than guessing, and say
   assert.ok(!d.findings.some(f => f.code === 'client-allowlist-veto'),
     'an unknown allowlist may not support a denial — that is the module\'s standing bias');
   assert.ok(d.findings.some(f => f.code === 'settings-flag-unread'));
+  assert.equal(d.findings.find(f => f.code === 'settings-flag-unread').severity, 'info');
+  assert.equal(d.blocked, false);
+});
+
+test('D4e: unreadable --settings under policyOverride is an explicit error, not a silent proceed', () => {
+  const argv = ['--settings', '/no/such/file.json', '--model', 'claude-opus-4-8'];
+  const d = preflightModel({
+    config: fixture(),
+    claudeArgs: argv,
+    availableModels: ['claude-opus-4-8'],
+    policyOverride: true,
+    flagSettings: readFlagSettingsModels(argv, () => { throw new Error('ENOENT'); }),
+  });
+  const unread = d.findings.find(f => f.code === 'settings-flag-unread');
+  assert.ok(unread, 'must surface the unreadable --settings');
+  assert.equal(unread.severity, 'error');
+  assert.equal(d.blocked, true, 'a named-but-unreadable settings file must refuse the launch');
+  assert.match(unread.message, /managed policy|silently/i);
 });
 
 test('readFlagSettingsModels reads both spellings and never returns anything but availableModels', () => {
