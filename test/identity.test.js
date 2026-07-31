@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { orgKey, sameIdentity, emailOf, matchAccounts } from '../src/identity.js';
+import { orgKey, sameIdentity, emailOf, matchAccounts, stableAccountPin } from '../src/identity.js';
 
 test('orgKey prefers orgUuid, falls back to orgName, else null', () => {
   assert.equal(orgKey({ orgUuid: 'u1', orgName: 'Acme' }), 'u1');
@@ -103,4 +103,21 @@ test('matchAccounts: unique email needs no org', () => {
 
 test('matchAccounts: no match returns empty', () => {
   assert.equal(matchAccounts(ACCTS, 'nobody@z.com').length, 0);
+});
+
+test('stableAccountPin prefers accountUuid/orgUuid, then accountUuid, then name', () => {
+  assert.equal(
+    stableAccountPin({ name: 'a@x.com (Acme)', accountUuid: 'p1', orgUuid: 'o1' }),
+    'p1/o1',
+  );
+  assert.equal(
+    stableAccountPin({ name: 'a@x.com', accountUuid: 'p1' }),
+    'p1',
+  );
+  assert.equal(
+    stableAccountPin({ name: 'api-key-acct', type: 'apikey' }),
+    'api-key-acct',
+  );
+  assert.equal(stableAccountPin(null), '');
+  assert.equal(stableAccountPin({}), '');
 });

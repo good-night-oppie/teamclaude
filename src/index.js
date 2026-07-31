@@ -8,7 +8,7 @@ import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConf
 import { AccountManager } from './account-manager.js';
 import { createProxyServer, resolveAccountPin } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
-import { sameIdentity, orgKey, matchAccounts } from './identity.js';
+import { sameIdentity, orgKey, matchAccounts, stableAccountPin } from './identity.js';
 import { resolveAccounts } from './resolve-accounts.js';
 import * as alias from './alias.js';
 import { ensureCerts } from './mitm.js';
@@ -711,8 +711,10 @@ async function envCommand() {
   if (useMitm) ({ caPath } = await ensureCerts(upstreamHost(config)));
 
   // TC_ACCT is the sole pin mechanism; --account is sugar that sets it.
-  // Prefer the resolved --account name (index sugar becomes a name TC_ACCT accepts).
-  const account = (accountPin ? accountPin.name : (process.env.TC_ACCT || '')).trim();
+  // Emit the STABLE pin form (uuid), not the mutable display name: a later
+  // rename must not silently repoint an already-eval'd shell at a different
+  // account. Bare TC_ACCT (no --account) is passed through unchanged.
+  const account = (accountPin ? accountPin.pin : (process.env.TC_ACCT || '')).trim();
   const lines = buildClaudeEnvLines({
     port, useMitm, caPath, holdSeconds: config.holdSeconds,
     account, proxyApiKey: config.proxy?.apiKey || '',
@@ -734,7 +736,11 @@ async function envCommand() {
       }
     }
   }
-  process.stderr.write(`# apply to this shell:  eval "$(teamclaude env${useMitm ? '' : ' --no-mitm'}${accountPin ? ` --account ${accountPin.name}` : ''})"\n`);
+  // Shell-quote the pin: display names (and even uuid forms pasted into odd
+  // shells) can carry spaces/metacharacters; an unquoted --account would break
+  // or inject into the suggested eval line.
+  const accountArg = accountPin ? ` --account ${shellSingleQuote(accountPin.pin)}` : '';
+  process.stderr.write(`# apply to this shell:  eval "$(teamclaude env${useMitm ? '' : ' --no-mitm'}${accountArg})"\n`);
   if (!(await isProxyUp(port))) {
     process.stderr.write(`# note: proxy not running on port ${port} — start it with: teamclaude server\n`);
   }
@@ -976,7 +982,15 @@ function resolveRunAccountPin(config, token) {
 
   const index = resolveConfigAccountPin(config, token);
   if (index == null) bail(`Unknown account pin "${token}".`);
-  return { token, index, name: accounts[index].name };
+  const acct = accounts[index];
+  // `pin` is the stable form to EMIT (env / suggested --account); `name` stays
+  // the human-readable label for stderr. See stableAccountPin.
+  return { token, index, name: acct.name, pin: stableAccountPin(acct) };
+}
+
+/** POSIX single-quote wrap so an interpolated value cannot break shell text. */
+function shellSingleQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
 
 // The fail-loud launch check. Reads Claude Code's settings tiers READ-ONLY and

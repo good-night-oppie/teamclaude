@@ -395,3 +395,39 @@ test('help lists the three commands and documents the doctor exit codes', async 
     assert.match(r.stdout, /--account NAME/);
   });
 });
+
+// ── env: stable pin emission + shell-safe eval hint (D4e) ─────
+
+test('D4e: `env --account` emits the uuid pin form, not the mutable display name', async () => {
+  await withCli(async ({ run }) => {
+    const r = run('env', '--account', 'primary');
+    assert.equal(r.status, 0);
+    // Qualified accountUuid/orgUuid is what a rename cannot silently repoint.
+    assert.match(r.stdout, /acct-primary%2Forg-primary/,
+      'emitted proxy URL must carry the stable uuid pin (/-encoded in userinfo)');
+    assert.ok(!r.stdout.includes('primary@') && !/proxy=http:\/\/primary[:@]/.test(r.stdout),
+      'display name must not be the emitted pin when uuids exist');
+    assert.match(r.stderr, /--account 'acct-primary\/org-primary'/,
+      'suggested eval must re-pin with the same stable form');
+  });
+});
+
+test('D4e: `env --account` falls back to the display name only when no uuid exists', async () => {
+  await withCli(async ({ configPath, run }) => {
+    const cfg = {
+      ...FIXTURE,
+      accounts: [
+        { name: "work's desk", type: 'apikey', apiKey: 'k', priority: 0 },
+        ...FIXTURE.accounts,
+      ],
+    };
+    await writeFile(configPath, JSON.stringify(cfg, null, 2));
+    const r = run('env', '--account', "work's desk");
+    assert.equal(r.status, 0);
+    // Name is the only identity; it must still appear (percent-encoded) in the URL.
+    assert.match(r.stdout, /work%27s%20desk/);
+    // Single-quote wrap with internal-quote escaping: 'work'\''s desk'
+    assert.match(r.stderr, /--account 'work'\\''s desk'/,
+      'spaces/metacharacters in the suggested eval must be shell-quoted');
+  });
+});
