@@ -18,7 +18,7 @@ import { TUI } from './tui.js';
 import { SxManager } from './sx.js';
 import { autoUpdate, checkForUpdate, currentVersion, runUpdate, installKind, PKG_NAME } from './updater.js';
 import { renderStatus } from './status-renderer.js';
-import { syncAccountsFromDisk } from './config-reload.js';
+import { syncAccountsFromDisk, applyTopLevelReload } from './config-reload.js';
 import { buildClaudeEnvLines, encodePinComponent, directLaunchEnvPlan } from './claude-env.js';
 import { deriveNamespace } from './model-namespace.js';
 import { explainRouting, formatExplain, launchSummary } from './route-explain.js';
@@ -311,12 +311,8 @@ async function serverCommand() {
     if (!diskConfig) return 0;
     const added = await syncAccountsFromDisk(diskConfig, config, accountManager, { importCredentials });
     // Pick up route table + routing-policy edits atomically with account policy.
-    config.routes = diskConfig.routes || [];
-    config.routingPolicy = diskConfig.routingPolicy || { mode: 'priority-first' };
-    config.rotationGate = diskConfig.rotationGate || { mode: 'enforce' };
-    accountManager.setRoutes(config.routes);
-    accountManager.setRoutingPolicy(config.routingPolicy);
-    accountManager.setRotationGate(config.rotationGate);
+    // ABSENT keys preserve the running value (D4b); present keys apply as written.
+    applyTopLevelReload(diskConfig, config, accountManager);
     // Apply an sx.org key/mode change made on disk (e.g. via POST /teamclaude/reload).
     const diskSxKey = diskConfig.sx?.apiKey || null;
     const diskSxMode = diskConfig.sx?.mode || 'always';

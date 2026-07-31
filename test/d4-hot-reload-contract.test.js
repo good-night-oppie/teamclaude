@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
-import { syncAccountsFromDisk } from '../src/config-reload.js';
+import { syncAccountsFromDisk, applyTopLevelReload } from '../src/config-reload.js';
 
 function apikey(name, extra = {}) {
   return { name, type: 'apikey', apiKey: 'k-' + name, ...extra };
@@ -60,4 +60,56 @@ test('D4a: reload removing tokenBudget restores zero-config-inert', async () => 
   assert.equal(am._isTokenBudgetTripped(am.accounts[0]), false,
     'absent budget is inert even if a stale window array remains');
   assert.equal(am._isAvailable(am.accounts[0], 'm'), true);
+});
+
+// ── (b) routingPolicy preserve-current on reload ───────────────────────────
+
+test('D4b: routingPolicy ABSENT on reload preserves running mode/affinity/reevaluateMs', () => {
+  const mem = {
+    accounts: [apikey('a')],
+    routes: [{ name: 'all', match: ['*'], accounts: ['a'] }],
+    routingPolicy: {
+      mode: 'dynamic',
+      preserveSessionAffinity: false,
+      reevaluateMs: 12_345,
+    },
+    rotationGate: { mode: 'shadow' },
+  };
+  const am = new AccountManager(mem.accounts, 0.98, {
+    routes: mem.routes,
+    routingPolicy: mem.routingPolicy,
+    rotationGate: mem.rotationGate,
+  });
+  const before = structuredClone(am.routingPolicy);
+  const beforeGate = structuredClone(am.rotationGate);
+  const beforeRoutes = structuredClone(am.getRoutes());
+
+  // Disk omits routingPolicy / rotationGate / routes entirely (partial reload).
+  applyTopLevelReload({ accounts: [apikey('a')] }, mem, am);
+
+  assert.deepEqual(am.routingPolicy, before, 'byte-identical running policy');
+  assert.deepEqual(mem.routingPolicy, before);
+  assert.deepEqual(am.rotationGate, beforeGate, 'co-located rotationGate also preserve-current');
+  assert.deepEqual(am.getRoutes(), beforeRoutes, 'co-located routes also preserve-current');
+});
+
+test('D4b: routingPolicy PRESENT with different mode applies; absent sibling keys preserved', () => {
+  const mem = {
+    accounts: [apikey('a')],
+    routingPolicy: {
+      mode: 'dynamic',
+      preserveSessionAffinity: false,
+      reevaluateMs: 12_345,
+    },
+  };
+  const am = new AccountManager(mem.accounts, 0.98, { routingPolicy: mem.routingPolicy });
+
+  applyTopLevelReload({
+    accounts: [apikey('a')],
+    routingPolicy: { mode: 'shadow' }, // explicit mode; affinity/reevaluateMs omitted
+  }, mem, am);
+
+  assert.equal(am.routingPolicy.mode, 'shadow', 'explicit present mode is operator intent');
+  assert.equal(am.routingPolicy.preserveSessionAffinity, false, 'absent key preserves running');
+  assert.equal(am.routingPolicy.reevaluateMs, 12_345, 'absent key preserves running');
 });

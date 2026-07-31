@@ -19,6 +19,49 @@ function findConfigAccount(config, account) {
   return config.accounts.findIndex(a => sameIdentity(a, account));
 }
 
+function hasOwn(obj, key) {
+  return Object.prototype.hasOwnProperty.call(obj || {}, key);
+}
+
+/**
+ * Top-level reload merge for routes / routingPolicy / rotationGate.
+ *
+ * ABSENT key ⇒ preserve the running value (B22 / D4b). An explicitly present
+ * key is operator intent and applies — including a mode change. Partial
+ * objects merge per-field so omitting preserveSessionAffinity/reevaluateMs
+ * cannot silently reset dynamic-mode knobs to code defaults.
+ */
+export function applyTopLevelReload(diskConfig, memConfig, accountManager) {
+  if (!diskConfig || !memConfig || !accountManager) return;
+
+  if (hasOwn(diskConfig, 'routes')) {
+    memConfig.routes = Array.isArray(diskConfig.routes) ? diskConfig.routes : [];
+    accountManager.setRoutes(memConfig.routes);
+  }
+
+  if (hasOwn(diskConfig, 'routingPolicy')) {
+    const disk = (diskConfig.routingPolicy && typeof diskConfig.routingPolicy === 'object')
+      ? diskConfig.routingPolicy : {};
+    const cur = memConfig.routingPolicy || accountManager.routingPolicy || {};
+    const merged = { ...cur };
+    for (const k of ['mode', 'preserveSessionAffinity', 'reevaluateMs']) {
+      if (hasOwn(disk, k)) merged[k] = disk[k];
+    }
+    memConfig.routingPolicy = merged;
+    accountManager.setRoutingPolicy(merged);
+  }
+
+  if (hasOwn(diskConfig, 'rotationGate')) {
+    const disk = (diskConfig.rotationGate && typeof diskConfig.rotationGate === 'object')
+      ? diskConfig.rotationGate : {};
+    const cur = memConfig.rotationGate || accountManager.rotationGate || {};
+    const merged = { ...cur };
+    if (hasOwn(disk, 'mode')) merged.mode = disk.mode;
+    memConfig.rotationGate = merged;
+    accountManager.setRotationGate(merged);
+  }
+}
+
 /** Disk is the authority for the account's config shape. Preserve mem-only
  * credential material only when disk omitted it (e.g. importFrom-only entries
  * whose tokens were resolved at startup and never written back). */
