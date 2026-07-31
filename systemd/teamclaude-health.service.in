@@ -12,7 +12,10 @@ Type=oneshot
 # Probe the local status endpoint with a tight budget; after three consecutive
 # failures, restart the data plane. Adapter health/failover remains internal to
 # TeamClaude and is deliberately not conflated with data-plane readiness.
-ExecStart=/bin/sh -c 'if curl -fsS --max-time 2 http://127.0.0.1:__TEAMCLAUDE_PORT__/teamclaude/status >/dev/null; then rm -f "$HOME/.local/state/teamclaude-health-failures"; exit 0; fi; f="$HOME/.local/state/teamclaude-health-failures"; n=$(( $(cat "$f" 2>/dev/null || echo 0) + 1 )); printf "%s\n" "$n" >"$f"; if [ "$n" -ge 3 ]; then rm -f "$f"; systemctl --user restart teamclaude.service; fi'
+# StateDirectory creates %S/teamclaude-health on a fresh system so the failure
+# counter has a writable home under ProtectHome=read-only (D4d).
+StateDirectory=teamclaude-health
+ExecStart=/bin/sh -c 'f="$STATE_DIRECTORY/failures"; if curl -fsS --max-time 2 http://127.0.0.1:__TEAMCLAUDE_PORT__/teamclaude/status >/dev/null; then rm -f "$f"; exit 0; fi; n=$(( $(cat "$f" 2>/dev/null || echo 0) + 1 )); printf "%s\n" "$n" >"$f"; if [ "$n" -ge 3 ]; then rm -f "$f"; systemctl --user restart teamclaude.service; fi'
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

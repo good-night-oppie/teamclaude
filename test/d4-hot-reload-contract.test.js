@@ -3,10 +3,15 @@
 // systemd health state dir).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
 import { syncAccountsFromDisk, applyTopLevelReload } from '../src/config-reload.js';
 import { createProxyServer, resolveAccountPin } from '../src/server.js';
+
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
 function apikey(name, extra = {}) {
   return { name, type: 'apikey', apiKey: 'k-' + name, ...extra };
@@ -259,4 +264,14 @@ test('D4c: resolveAccountPin skips retired accounts', () => {
   am.retireAccount(0);
   assert.equal(resolveAccountPin(am, 'a'), null);
   assert.equal(resolveAccountPin(am, 'b'), 1);
+});
+
+// ── (d) systemd health-service state dir ───────────────────────────────────
+
+test('D4d: health unit declares StateDirectory for failure counter', () => {
+  const unit = readFileSync(join(ROOT, 'systemd/teamclaude-health.service.in'), 'utf8');
+  assert.match(unit, /^\s*StateDirectory\s*=\s*\S+/m,
+    'packaged installs need StateDirectory= so the state dir exists on a fresh system');
+  assert.match(unit, /STATE_DIRECTORY|%S\//,
+    'failure counter must live under the managed state directory');
 });
