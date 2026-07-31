@@ -114,6 +114,9 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     }
 
     const mgr = accountManager.accounts[mgrIdx];
+    // Same identity reappearing after a prior retire: revive the tombstone so
+    // the process-lifetime index stays the provenance key for this account.
+    if (mgr.retired) accountManager.reviveAccount(mgrIdx);
     if (diskAcct.orgUuid && !mgr.orgUuid) mgr.orgUuid = diskAcct.orgUuid;
     if (diskAcct.orgName && !mgr.orgName) mgr.orgName = diskAcct.orgName;
     if (diskAcct.name && mgr.name !== diskAcct.name) mgr.name = diskAcct.name;
@@ -155,6 +158,20 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       log(`[TeamClaude] Updated API key for "${mgr.name}"`);
     }
   }
+
+  // D4c: disk deletions must retire the live account. The `claimed` set already
+  // names survivors; unclaimed slots become tombstones (index-stable) rather
+  // than splices that would reassign account_index to a different identity.
+  for (let i = 0; i < accountManager.accounts.length; i++) {
+    if (claimed.has(i)) continue;
+    const mgr = accountManager.accounts[i];
+    if (!mgr || mgr.retired) continue;
+    accountManager.retireAccount(i);
+    const memIdx = findConfigAccount(memConfig, mgr);
+    if (memIdx >= 0) memConfig.accounts.splice(memIdx, 1);
+    log(`[TeamClaude] Retired account "${mgr.name}" (removed from config)`);
+  }
+
   // Hot-swap boundary: accounts/blockedModels on memConfig just changed; drop
   // the ingress collision gate's normalized-view cache so the next request
   // re-reads the new identity (fingerprint miss would also suffice).

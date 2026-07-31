@@ -251,12 +251,15 @@ async function serverCommand() {
   // accounts added externally, e.g. by `teamclaude import` while server is running)
   accountManager.onTokenRefresh((idx, newTokens) => {
     const account = accountManager.accounts[idx];
-    if (!account) return;
-    // Keep config.accounts in sync so TUI saveConfig doesn't clobber fresh tokens
-    if (config.accounts[idx]) {
-      config.accounts[idx].accessToken = newTokens.accessToken;
-      config.accounts[idx].refreshToken = newTokens.refreshToken;
-      config.accounts[idx].expiresAt = newTokens.expiresAt;
+    if (!account || account.retired) return;
+    // Keep config.accounts in sync so TUI saveConfig doesn't clobber fresh tokens.
+    // Match by identity: after D4c tombstone retires, memConfig is compacted and
+    // no longer shares indices with accountManager.accounts.
+    const memIdx = config.accounts.findIndex(a => sameIdentity(a, account));
+    if (memIdx >= 0) {
+      config.accounts[memIdx].accessToken = newTokens.accessToken;
+      config.accounts[memIdx].refreshToken = newTokens.refreshToken;
+      config.accounts[memIdx].expiresAt = newTokens.expiresAt;
     }
     atomicConfigUpdate(diskConfig => {
       // Pick up any new accounts from disk so index matching stays correct
@@ -348,8 +351,10 @@ async function serverCommand() {
         // Write in-memory accounts as the authoritative state, preserving
         // extra disk-only fields (e.g. importFrom) where the account still exists.
         // Use live tokens from AccountManager (not the stale config.accounts copy).
-        diskConfig.accounts = config.accounts.map((a, i) => {
-          const am = accountManager.accounts[i];
+        // Identity-match live tokens: manager slots may hold D4c tombstones
+        // whose indices no longer align with the compacted config.accounts list.
+        diskConfig.accounts = config.accounts.map((a) => {
+          const am = accountManager.accounts.find(x => !x.retired && sameIdentity(x, a));
           const live = am ? {
             ...a,
             accessToken: am.credential,

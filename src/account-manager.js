@@ -125,6 +125,9 @@ function makeAccount(acct, index) {
     // its reset-time comparator was unreachable).
     costTier: Number.isFinite(acct.costTier) ? acct.costTier : 0,
     disabled: acct.disabled || false,
+    // D4c: config-reload tombstone. Index stays stable for the process lifetime
+    // so provenance account_index cannot be reused by a different account.
+    retired: !!acct.retired,
     upstream: acct.upstream || null,
     modelMap: acct.modelMap || null,
     models: acct.models || null,
@@ -937,6 +940,9 @@ export class AccountManager {
   _isAvailable(account, model = null, advisorModel = null) {
     if (!account) return false;
 
+    // Config-reload tombstone: removed from disk, kept only for index stability.
+    if (account.retired) return false;
+
     // Manually disabled accounts are skipped entirely until re-enabled.
     if (account.disabled) return false;
 
@@ -1004,6 +1010,7 @@ export class AccountManager {
    */
   _unavailableReason(account, model = null, advisorModel = null) {
     if (!account) return 'disabled';
+    if (account.retired) return 'disabled';
     if (account.disabled) return 'disabled';
     if (account.status === 'throttled' && account.rateLimitedUntil
         && Date.now() < account.rateLimitedUntil) {
@@ -2274,6 +2281,34 @@ export class AccountManager {
     // per-key surgery: the next request re-evaluates with a fresh timestamp.
     this._dynamicCurrentByKey.clear();
     this._dynamicEvalAtByKey.clear();
+  }
+
+  /**
+   * Retire an account in place (config reload removed it). Keeps the array
+   * slot and `index` stable for the process lifetime so provenance cannot
+   * mis-attribute a later account that reuses a compacted slot. Credentials
+   * stay on the object so an in-flight request that already selected it can
+   * finish (no mid-request rug-pull); new selection/pins/probes/warm skip it.
+   */
+  retireAccount(index) {
+    const account = this.accounts[index];
+    if (!account || account.retired) return;
+    account.retired = true;
+    account.disabled = true;
+    for (const [name, idx] of [...this.routePins.entries()]) {
+      if (idx === index) this.routePins.delete(name);
+    }
+    if (this.currentIndex === index) {
+      const next = this.accounts.findIndex(a => !a.retired && !a.disabled);
+      if (next >= 0) this.currentIndex = next;
+    }
+  }
+
+  /** Undo retireAccount when the same identity reappears on a later reload. */
+  reviveAccount(index) {
+    const account = this.accounts[index];
+    if (!account || !account.retired) return;
+    account.retired = false;
   }
 
   /**

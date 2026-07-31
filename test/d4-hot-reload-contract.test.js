@@ -3,11 +3,23 @@
 // systemd health state dir).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
 import { syncAccountsFromDisk, applyTopLevelReload } from '../src/config-reload.js';
+import { createProxyServer, resolveAccountPin } from '../src/server.js';
 
 function apikey(name, extra = {}) {
   return { name, type: 'apikey', apiKey: 'k-' + name, ...extra };
+}
+
+function listen(server) {
+  return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
+}
+function close(server) {
+  return new Promise(resolve => {
+    server.closeAllConnections?.();
+    server.close(resolve);
+  });
 }
 
 // ── (a) tokenBudget reload-updatable ───────────────────────────────────────
@@ -112,4 +124,139 @@ test('D4b: routingPolicy PRESENT with different mode applies; absent sibling key
   assert.equal(am.routingPolicy.mode, 'shadow', 'explicit present mode is operator intent');
   assert.equal(am.routingPolicy.preserveSessionAffinity, false, 'absent key preserves running');
   assert.equal(am.routingPolicy.reevaluateMs, 12_345, 'absent key preserves running');
+});
+
+// ── (c) syncAccountsFromDisk prunes removed accounts ───────────────────────
+
+test('D4c: removed account leaves rotation; pin refuses; sibling indices stable', async () => {
+  let upstreamHits = 0;
+  const upstream = http.createServer((req, res) => {
+    upstreamHits++;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ type: 'message', content: [], usage: { input_tokens: 1, output_tokens: 1 } }));
+  });
+  const upPort = await listen(upstream);
+  const url = `http://127.0.0.1:${upPort}`;
+
+  const mem = {
+    accounts: [
+      apikey('keep', { upstream: url, priority: 0 }),
+      apikey('drop', { upstream: url, priority: 1 }),
+      apikey('tail', { upstream: url, priority: 2 }),
+    ],
+    routes: [{ name: 'all', match: ['*'], accounts: ['keep', 'drop', 'tail'] }],
+  };
+  const am = new AccountManager(mem.accounts, 0.98, { routes: mem.routes });
+  assert.equal(am.accounts[2].name, 'tail');
+  assert.equal(am.accounts[2].index, 2);
+
+  const disk = {
+    accounts: [
+      apikey('keep', { upstream: url, priority: 0 }),
+      apikey('tail', { upstream: url, priority: 2 }),
+    ],
+    routes: [{ name: 'all', match: ['*'], accounts: ['keep', 'tail'] }],
+  };
+  await syncAccountsFromDisk(disk, mem, am);
+  applyTopLevelReload(disk, mem, am);
+
+  const drop = am.accounts.find(a => a.name === 'drop');
+  assert.ok(drop, 'tombstone keeps the slot for index stability');
+  assert.equal(drop.retired, true);
+  assert.equal(drop.index, 1, 'retired account keeps its process-lifetime index');
+  assert.equal(am.accounts[2].name, 'tail');
+  assert.equal(am.accounts[2].index, 2, 'tail must NOT slide into drop\'s index');
+  assert.equal(am._isAvailable(drop, 'm'), false, 'retired not serveable');
+  assert.equal(mem.accounts.some(a => a.name === 'drop'), false,
+    'mem config must not resurrect the removed account on save');
+
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: url });
+  const port = await listen(proxy);
+  try {
+    const pinRes = await fetch(`http://127.0.0.1:${port}/tc-acct/drop/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'm', messages: [] }),
+    });
+    const pinBody = await pinRes.text();
+    assert.equal(pinRes.status, 404, pinBody);
+    assert.match(pinBody, /removed from config|retired|Unknown account pin/i);
+    assert.equal(upstreamHits, 0, 'pin must not silently serve on a retired account');
+
+    const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'm', messages: [] }),
+    });
+    assert.equal(res.status, 200, await res.text());
+    assert.ok(upstreamHits >= 1);
+    const active = am.getActiveAccount(new Set(), 'm');
+    assert.ok(active && active.name !== 'drop');
+    assert.equal(am.accounts[2].name, 'tail');
+    assert.equal(am.accounts[2].index, 2);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('D4c: in-flight request on an account finishes after that account is retired', async () => {
+  let releaseUpstream;
+  const upstreamGate = new Promise(r => { releaseUpstream = r; });
+  let upstreamHits = 0;
+  const upstream = http.createServer((req, res) => {
+    upstreamHits++;
+    const chunks = [];
+    req.on('data', c => chunks.push(c));
+    req.on('end', async () => {
+      await upstreamGate;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        type: 'message', content: [{ type: 'text', text: 'ok' }],
+        usage: { input_tokens: 1, output_tokens: 1 },
+      }));
+    });
+  });
+  const upPort = await listen(upstream);
+  const url = `http://127.0.0.1:${upPort}`;
+
+  const mem = {
+    accounts: [
+      apikey('inflight', { upstream: url, priority: 0 }),
+      apikey('other', { upstream: url, priority: 1 }),
+    ],
+  };
+  const am = new AccountManager(mem.accounts, 0.98);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: url });
+  const port = await listen(proxy);
+  try {
+    const pending = fetch(`http://127.0.0.1:${port}/tc-acct/inflight/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'm', messages: [] }),
+    });
+    for (let i = 0; i < 50 && upstreamHits === 0; i++) await new Promise(r => setTimeout(r, 20));
+    assert.equal(upstreamHits, 1, 'request must be in-flight before retire');
+
+    await syncAccountsFromDisk({
+      accounts: [apikey('other', { upstream: url, priority: 1 })],
+    }, mem, am);
+
+    assert.equal(am.accounts[0].retired, true);
+    releaseUpstream();
+    const res = await pending;
+    assert.equal(res.status, 200, 'in-flight must finish; no mid-request rug-pull');
+    await res.text();
+  } finally {
+    releaseUpstream?.();
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('D4c: resolveAccountPin skips retired accounts', () => {
+  const am = new AccountManager([apikey('a'), apikey('b')], 0.98);
+  am.retireAccount(0);
+  assert.equal(resolveAccountPin(am, 'a'), null);
+  assert.equal(resolveAccountPin(am, 'b'), 1);
 });

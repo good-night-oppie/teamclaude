@@ -383,8 +383,11 @@ export function resolveAccountPin(accountManager, token) {
   const t = norm(token);
   if (!t) return null;
 
-  const at = (pick) => accounts.findIndex(a => norm(pick(a)) === t);
-  const qualified = accounts.findIndex(a => a.accountUuid && a.orgUuid
+  // Skip config-reload tombstones: a pin to a removed account must fail
+  // clearly, never silently serve (D4c).
+  const live = (a) => a && !a.retired;
+  const at = (pick) => accounts.findIndex(a => live(a) && norm(pick(a)) === t);
+  const qualified = accounts.findIndex(a => live(a) && a.accountUuid && a.orgUuid
     && `${norm(a.accountUuid)}/${norm(a.orgUuid)}` === t);
 
   for (const i of [
@@ -395,6 +398,25 @@ export function resolveAccountPin(accountManager, token) {
     at(a => (a.name || '').split(' (')[0]), // display name minus the org suffix
   ]) if (i >= 0) return i;
 
+  return null;
+}
+
+/** True when `token` names a retired (config-removed) account tombstone. */
+export function matchRetiredAccountPin(accountManager, token) {
+  const accounts = accountManager.accounts || [];
+  const norm = (s) => (s || '').trim().toLowerCase();
+  const t = norm(token);
+  if (!t) return null;
+  const at = (pick) => accounts.findIndex(a => a?.retired && norm(pick(a)) === t);
+  const qualified = accounts.findIndex(a => a?.retired && a.accountUuid && a.orgUuid
+    && `${norm(a.accountUuid)}/${norm(a.orgUuid)}` === t);
+  for (const i of [
+    qualified,
+    at(a => a.accountUuid),
+    at(a => a.orgUuid),
+    at(a => a.name),
+    at(a => (a.name || '').split(' (')[0]),
+  ]) if (i >= 0) return accounts[i];
   return null;
 }
 
@@ -565,11 +587,17 @@ export function createProxyRequestListener({
         if (pinnedIndex == null) {
           // Unknown-pin 404 precedes provenance request_id assignment — out of
           // provenance scope (critique fix #2). Activity log still records it.
+          // D4c: a pin naming a config-reload tombstone gets an explicit refusal
+          // rather than the generic unknown-pin wording.
+          const retired = matchRetiredAccountPin(accountManager, token);
+          const pinMsg = retired
+            ? `Account "${retired.name}" was removed from config (retired); pin refused`
+            : `Unknown account pin "${token}"`;
           const reqId = ++counter;
           const sessionId = req.headers['x-claude-code-session-id'] || null;
-          if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(unknown pin: "${token}")`, status: 404, model: null, sessionId, pinned: false });
+          if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(${retired ? 'retired' : 'unknown'} pin: "${token}")`, status: 404, model: null, sessionId, pinned: false });
           res.writeHead(404, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Unknown account pin "${token}"` } }));
+          res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: pinMsg } }));
           return;
         }
         req.url = afterPrefix.slice(tokenEnd);
@@ -584,11 +612,15 @@ export function createProxyRequestListener({
       if (pinnedIndex == null && forcedPin != null) {
         pinnedIndex = resolveAccountPin(accountManager, forcedPin);
         if (pinnedIndex == null) {
+          const retired = matchRetiredAccountPin(accountManager, forcedPin);
+          const pinMsg = retired
+            ? `Account "${retired.name}" was removed from config (retired); pin refused`
+            : `Unknown account pin "${forcedPin}" (from TC_ACCT)`;
           const reqId = ++counter;
           const sessionId = req.headers['x-claude-code-session-id'] || null;
-          if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(unknown pin: "${forcedPin}")`, status: 404, model: null, sessionId, pinned: false });
+          if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(${retired ? 'retired' : 'unknown'} pin: "${forcedPin}")`, status: 404, model: null, sessionId, pinned: false });
           res.writeHead(404, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Unknown account pin "${forcedPin}" (from TC_ACCT)` } }));
+          res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: pinMsg } }));
           return;
         }
       }
