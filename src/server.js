@@ -16,7 +16,7 @@ import { BodyWriter } from './request-log.js';
 import { upstreamFetch } from './upstream-fetch.js';
 import { tunnelTls } from './sx.js';
 import { buildIdentity, PROCESS_STARTED_AT, registerBuildFeature } from './build-identity.js';
-import { ProvenanceBuffer } from './provenance.js';
+import { ProvenanceBuffer, classifyUpstreamRelayOutcome } from './provenance.js';
 // Ensure the model-preflight layer's tag is registered even when the CLI entry
 // has not been loaded (status via createProxyServer alone).
 import './model-preflight.js';
@@ -1729,9 +1729,15 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
 
     res.writeHead(upstreamRes.status, responseHeaders);
 
-    const relayOutcome = (upstreamRes.status >= 200 && upstreamRes.status < 300)
-      ? 'ok'
-      : 'upstream-error-relayed';
+    // D10: path-based labels (count-tokens-unsupported) need no body; body-based
+    // labels (upstream-thinking-required) refine after the non-stream buffer.
+    // Empty/stream paths pass body:null → conservative fall-through.
+    const classifyRelay = (body = null) => classifyUpstreamRelayOutcome({
+      status: upstreamRes.status,
+      path: ctx.path,
+      pathClass: ctx.pathClass,
+      body,
+    });
 
     if (!upstreamRes.body) {
       const l = getLog();
@@ -1740,7 +1746,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       emitProvenance(ctx, {
         _account: account,
         final: true,
-        outcome: relayOutcome,
+        outcome: classifyRelay(null),
         response_status: upstreamRes.status,
         attempt: ctx.attempt,
         stream: false,
@@ -1770,6 +1776,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       l?.end();
       // R2: sliding-window budget from already-parsed attempt usage (no re-parse).
       accountManager.recordTokenBudget(account.index, ctx.attemptRec.usage);
+      // Stream: no full body — thinking-required falls through; path labels still apply.
+      const relayOutcome = classifyRelay(null);
       const outcome = res.destroyed ? 'client-disconnect' : relayOutcome;
       emitProvenance(ctx, {
         _account: account,
@@ -1801,7 +1809,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       emitProvenance(ctx, {
         _account: account,
         final: true,
-        outcome: relayOutcome,
+        outcome: classifyRelay(buf),
         response_status: upstreamRes.status,
         attempt: ctx.attempt,
         stream: false,

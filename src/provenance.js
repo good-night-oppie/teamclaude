@@ -82,7 +82,49 @@ export const PROVENANCE_OUTCOMES = Object.freeze([
   'config-reload',
   // D7: inference path refused a null/unparseable model under a configured route table.
   'rejected-null-model',
+  // D10: deepseek thinking-mode 400 (content[].thinking absent) — countability only.
+  'upstream-thinking-required',
+  // D10: adapter 404 on /v1/messages/count_tokens — countability only.
+  'count-tokens-unsupported',
 ]);
+
+/**
+ * D10: stable substring from deepseek adapter 400 when thinking mode is on but
+ * content[].thinking blocks were not passed back. Exact match only — any doubt
+ * falls through to upstream-error-relayed.
+ */
+export const UPSTREAM_THINKING_REQUIRED_MARKER =
+  'The `content[].thinking` in the thinking mode must be passed back to the API';
+
+/**
+ * D10: classify a relayed upstream non-OK response into a specific outcome label.
+ * Outcome labels only — does not change retry/relay/policy. Conservative:
+ * unknown → `upstream-error-relayed`; 2xx → `ok`.
+ *
+ * @param {{ status: number, path?: string|null, pathClass?: string|null, body?: string|Buffer|null }} args
+ * @returns {string}
+ */
+export function classifyUpstreamRelayOutcome({ status, path = null, pathClass = null, body = null } = {}) {
+  if (Number.isFinite(status) && status >= 200 && status < 300) return 'ok';
+  // 404 on count_tokens path (pathClass preferred; path sanitized as fallback).
+  if (status === 404) {
+    const isCountTokens = pathClass === 'count_tokens'
+      || sanitizeProvenancePath(path) === '/v1/messages/count_tokens';
+    if (isCountTokens) return 'count-tokens-unsupported';
+  }
+  // 400 whose body carries the exact deepseek thinking-required marker.
+  if (status === 400 && body != null) {
+    let text = null;
+    if (typeof body === 'string') text = body;
+    else if (Buffer.isBuffer(body)) {
+      try { text = body.toString('utf8'); } catch { text = null; }
+    }
+    if (text != null && text.includes(UPSTREAM_THINKING_REQUIRED_MARKER)) {
+      return 'upstream-thinking-required';
+    }
+  }
+  return 'upstream-error-relayed';
+}
 
 const SAFE_SET = new Set(PROVENANCE_SAFE_FIELDS);
 const PATH_CAP = 128;
