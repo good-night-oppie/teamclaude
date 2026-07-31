@@ -275,3 +275,25 @@ test('D4d: health unit declares StateDirectory for failure counter', () => {
   assert.match(unit, /STATE_DIRECTORY|%S\//,
     'failure counter must live under the managed state directory');
 });
+
+// ── (D4e-1) health probe port follows the rendered unit, not 3456 ──────────
+
+test('D4e: health unit probes Environment=TEAMCLAUDE_PORT, not hardcoded 3456', () => {
+  const unit = readFileSync(join(ROOT, 'systemd/teamclaude-health.service.in'), 'utf8');
+  assert.match(unit, /^\s*Environment\s*=\s*TEAMCLAUDE_PORT=__TEAMCLAUDE_PORT__\s*$/m,
+    'port must be an Environment= template var, same install-time substitution as __TEAMCLAUDE_BIN__');
+  assert.match(unit, /\$\{TEAMCLAUDE_PORT\}/,
+    'ExecStart must expand the env var, not embed a literal port');
+  assert.doesNotMatch(unit, /127\.0\.0\.1:3456/,
+    'default 3456 must not be hardcoded in the probe URL');
+
+  // Install-time render: a non-default port must land on the actionable lines.
+  // (Comments may still mention 3456 as the documented default — that is fine.)
+  const rendered = unit.replaceAll('__TEAMCLAUDE_PORT__', '9999');
+  const envLine = rendered.split('\n').find(l => /^\s*Environment\s*=/.test(l)) || '';
+  const execLine = rendered.split('\n').find(l => /^\s*ExecStart\s*=/.test(l)) || '';
+  assert.equal(envLine.trim(), 'Environment=TEAMCLAUDE_PORT=9999');
+  assert.match(execLine, /\$\{TEAMCLAUDE_PORT\}/);
+  assert.doesNotMatch(envLine, /3456|__TEAMCLAUDE_PORT__/);
+  assert.doesNotMatch(execLine, /3456|__TEAMCLAUDE_PORT__/);
+});

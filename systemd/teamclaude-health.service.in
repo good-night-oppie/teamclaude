@@ -7,7 +7,9 @@ Type=oneshot
 # Replace __TEAMCLAUDE_PORT__ at install time with config.proxy.port (default
 # 3456), the same hand-substitution as __TEAMCLAUDE_BIN__ in teamclaude.service.in.
 # Hardcoding 3456 made this probe fail forever on a non-default port and restart
-# a perfectly healthy data plane every 90s.
+# a perfectly healthy data plane every 90s. Environment= carries the rendered
+# port so ExecStart can reference ${TEAMCLAUDE_PORT} instead of baking digits
+# into the shell snippet twice.
 # systemd restarts a failed process, but a wedged event loop is still "active".
 # Probe the local status endpoint with a tight budget; after three consecutive
 # failures, restart the data plane. Adapter health/failover remains internal to
@@ -15,7 +17,8 @@ Type=oneshot
 # StateDirectory creates %S/teamclaude-health on a fresh system so the failure
 # counter has a writable home under ProtectHome=read-only (D4d).
 StateDirectory=teamclaude-health
-ExecStart=/bin/sh -c 'f="$STATE_DIRECTORY/failures"; if curl -fsS --max-time 2 http://127.0.0.1:__TEAMCLAUDE_PORT__/teamclaude/status >/dev/null; then rm -f "$f"; exit 0; fi; n=$(( $(cat "$f" 2>/dev/null || echo 0) + 1 )); printf "%s\n" "$n" >"$f"; if [ "$n" -ge 3 ]; then rm -f "$f"; systemctl --user restart teamclaude.service; fi'
+Environment=TEAMCLAUDE_PORT=__TEAMCLAUDE_PORT__
+ExecStart=/bin/sh -c 'f="$STATE_DIRECTORY/failures"; if curl -fsS --max-time 2 http://127.0.0.1:${TEAMCLAUDE_PORT}/teamclaude/status >/dev/null; then rm -f "$f"; exit 0; fi; n=$(( $(cat "$f" 2>/dev/null || echo 0) + 1 )); printf "%s\n" "$n" >"$f"; if [ "$n" -ge 3 ]; then rm -f "$f"; systemctl --user restart teamclaude.service; fi'
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
