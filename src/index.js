@@ -19,7 +19,7 @@ import { SxManager } from './sx.js';
 import { autoUpdate, checkForUpdate, currentVersion, runUpdate, installKind, PKG_NAME } from './updater.js';
 import { renderStatus } from './status-renderer.js';
 import { syncAccountsFromDisk, applyTopLevelReload } from './config-reload.js';
-import { buildClaudeEnvLines, encodePinComponent, directLaunchEnvPlan } from './claude-env.js';
+import { buildClaudeEnvLines, encodePinComponent, directLaunchEnvPlan, redactUrlUserinfo } from './claude-env.js';
 import { deriveNamespace } from './model-namespace.js';
 import { explainRouting, formatExplain, launchSummary } from './route-explain.js';
 import {
@@ -900,7 +900,9 @@ async function runCommand() {
       console.error(`[TeamClaude] Cleared ${plan.clear.join(', ')} — they pointed at the proxy on port ${port}, which is down; a direct launch must not route through it.`);
     }
     for (const { names, value } of plan.remaining) {
-      console.error(`[TeamClaude] NOTE: ${names.join(', ')} = ${value} — set to something that is NOT this proxy, so it is left alone (it may be a corporate egress proxy or another teamclaude). This launch is "direct" only with respect to port ${port}; claude's traffic still traverses that proxy.`);
+      // Redact userinfo: proxy URLs carry credentials (teamclaude embeds its API
+      // key there). Logging the raw value is SECRET_IN_PANE (B62).
+      console.error(`[TeamClaude] NOTE: ${names.join(', ')} = ${redactUrlUserinfo(value)} — set to something that is NOT this proxy, so it is left alone (it may be a corporate egress proxy or another teamclaude). This launch is "direct" only with respect to port ${port}; claude's traffic still traverses that proxy.`);
     }
     directLaunchVia = plan.remaining;
     if (accountPin) {

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildClaudeEnvLines, directLaunchEnvPlan } from '../src/claude-env.js';
+import { buildClaudeEnvLines, directLaunchEnvPlan, redactUrlUserinfo } from '../src/claude-env.js';
 
 test('MITM mode (default) emits proxy vars + CA cert, and clears ANTHROPIC_BASE_URL', () => {
   const lines = buildClaudeEnvLines({ port: 3456, caPath: '/home/u/.config/teamclaude-ca.pem' });
@@ -196,4 +196,46 @@ test('directLaunchEnvPlan mutates nothing and tolerates junk', () => {
   for (const junk of [null, undefined, {}, { HTTPS_PROXY: 7 }, { HTTPS_PROXY: '' }]) {
     assert.doesNotThrow(() => directLaunchEnvPlan(junk, 3456));
   }
+});
+
+// ── D12c: redactUrlUserinfo (SECRET_IN_PANE / B62) ────────────
+//
+// --auto-fallback diagnostics print inherited proxy URLs. Those URLs carry
+// credentials in userinfo (teamclaude's own MITM pin embeds its API key). The
+// logged form must keep host:port and drop userinfo.
+
+test('D12c (a): URL with userinfo logs host:port only, no credentials', () => {
+  assert.equal(
+    redactUrlUserinfo('http://pin:super-secret-api-key@127.0.0.1:3456'),
+    'http://127.0.0.1:3456',
+  );
+  assert.equal(
+    redactUrlUserinfo('http://user:pass@corp.example:8080/path?q=1'),
+    'http://corp.example:8080/path?q=1',
+  );
+  assert.doesNotMatch(
+    redactUrlUserinfo('http://pin:super-secret-api-key@127.0.0.1:3456'),
+    /super-secret-api-key|pin@/,
+  );
+});
+
+test('D12c (b): URL without userinfo is unchanged', () => {
+  assert.equal(redactUrlUserinfo('http://127.0.0.1:3456'), 'http://127.0.0.1:3456');
+  assert.equal(redactUrlUserinfo('https://api.anthropic.com'), 'https://api.anthropic.com');
+  assert.equal(redactUrlUserinfo('http://corp.example:8080/proxy'), 'http://corp.example:8080/proxy');
+});
+
+test('D12c (c): redaction regex handles https and http', () => {
+  assert.equal(
+    redactUrlUserinfo('https://pin:key@proxy.example:443'),
+    'https://proxy.example:443',
+  );
+  assert.equal(
+    redactUrlUserinfo('HTTP://PIN:KEY@Proxy.Example:8080'),
+    'HTTP://Proxy.Example:8080',
+  );
+  assert.equal(
+    redactUrlUserinfo('Https://a:b@host'),
+    'Https://host',
+  );
 });

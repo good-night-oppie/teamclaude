@@ -462,6 +462,31 @@ test('D12b: proxy-up + stale pin still fails loud', async () => {
   });
 });
 
+// ── D12c: --auto-fallback must not log proxy URL userinfo (SECRET_IN_PANE) ─
+//
+// Inherited HTTPS_PROXY pointing elsewhere is left alone and diagnosed on
+// stderr. Credentials in the userinfo segment must never appear in that
+// diagnostic (or the launchSummary line that also narrates the hop).
+
+test('D12c: auto-fallback diagnostic redacts userinfo from inherited proxy URLs', async () => {
+  await withRun(async ({ runWithEnv }) => {
+    const secret = 'd12c-stderr-secret-must-not-leak';
+    const r = runWithEnv({
+      HTTPS_PROXY: `http://pin:${secret}@corp.example:8080`,
+      HTTP_PROXY: `http://pin:${secret}@corp.example:8080`,
+      https_proxy: `http://pin:${secret}@corp.example:8080`,
+      http_proxy: `http://pin:${secret}@corp.example:8080`,
+    }, '--auto-fallback', '--', '-p', 'hi');
+    assert.match(r.stderr, /launching claude directly/);
+    assert.match(r.stderr, /NOTE:.*HTTPS_PROXY.*http:\/\/corp\.example:8080/,
+      `host:port must remain visible:\n${r.stderr}`);
+    assert.doesNotMatch(r.stderr, new RegExp(secret),
+      `userinfo credential must not appear on stderr:\n${r.stderr}`);
+    assert.doesNotMatch(r.stderr, /pin:d12c|pin@corp/,
+      'pin username must not appear either');
+  });
+});
+
 test('run --account accepts every stable TC_ACCT identity form', async () => {
   await withRun(async ({ run }) => {
     const cases = [

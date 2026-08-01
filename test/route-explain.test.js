@@ -504,6 +504,19 @@ test('a direct launch refuses to describe teamclaude routing at all', () => {
     'the proxy is bypassed, so no account claim is truthful');
 });
 
+// D12c: launchSummary narrates inherited proxy hops — must redact userinfo.
+test('D12c: launchSummary redacts userinfo from inherited via proxy URLs', () => {
+  const secret = 'd12c-launch-summary-secret';
+  const line = launchSummary(fixture(), {
+    model: FABLE,
+    routingApplies: false,
+    via: [{ names: ['HTTPS_PROXY'], value: `http://pin:${secret}@corp.example:8080` }],
+  });
+  assert.match(line, /HTTPS_PROXY=http:\/\/corp\.example:8080/);
+  assert.doesNotMatch(line, new RegExp(secret));
+  assert.doesNotMatch(line, /pin@|pin:/);
+});
+
 test('no --model is stated as unknown rather than guessed', () => {
   const line = launchSummary(fixture(), {});
   assert.match(line, /no --model/);

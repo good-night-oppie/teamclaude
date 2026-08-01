@@ -41,6 +41,7 @@
 //   failover / no-failover    server.js:542-552, :606, :704-737, :794-807, :864
 
 import { modelGlobMatches, weeklyBucketForModel } from './model.js';
+import { redactUrlUserinfo } from './claude-env.js';
 import {
   normalizeRoutes,
   normalizeAccounts,
@@ -719,7 +720,9 @@ export function launchSummary(config, {
   if (!routingApplies) {
     const hops = (Array.isArray(via) ? via : []).filter(v => v && v.value);
     const through = hops.length
-      ? ` — but still via inherited ${hops.map(v => `${(v.names || [])[0] || 'proxy'}=${v.value}`).join(', ')}`
+      // Redact userinfo before narrating: inherited proxy URLs may embed
+      // credentials (B62 SECRET_IN_PANE). Destination host:port stays visible.
+      ? ` — but still via inherited ${hops.map(v => `${(v.names || [])[0] || 'proxy'}=${redactUrlUserinfo(v.value)}`).join(', ')}`
       : ' — teamclaude routing does not apply';
     return `${id ? `model ${id}` : 'no --model'} → direct launch, bypassing this proxy${through}`;
   }

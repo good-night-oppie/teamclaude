@@ -71,6 +71,18 @@ export function buildClaudeEnvLines({ port, useMitm = true, caPath = null, holdS
 const PROXY_VARS = ['HTTPS_PROXY', 'HTTP_PROXY', 'https_proxy', 'http_proxy'];
 
 /**
+ * Strip URL userinfo before logging. Proxy URLs — including teamclaude's own
+ * MITM pin form `http://<pin>:<apiKey>@host:port` — carry credentials in the
+ * userinfo segment; stderr and captured session logs must not echo them
+ * (B62 SECRET_IN_PANE). Preserves scheme + host + port + path. Non-http(s)
+ * strings pass through unchanged.
+ */
+export function redactUrlUserinfo(value) {
+  if (typeof value !== 'string') return value;
+  return value.replace(/^(https?:\/\/)([^\/@]+@)?/i, '$1');
+}
+
+/**
  * What a DIRECT launch must do about proxy variables it inherited.
  *
  * `--auto-fallback` promises to launch claude "directly, bypassing the proxy"
