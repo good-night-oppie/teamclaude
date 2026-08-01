@@ -777,26 +777,52 @@ async function runCommand() {
     process.exit(1);
   }
 
-  // --account <name> is sugar for TC_ACCT. Resolve the effective pin ONCE
-  // before anything else so a typo costs nothing: an unknown pin would otherwise
-  // reach the server as a 404 on the FIRST request, i.e. after claude has already
-  // started and the operator has stopped watching. Bare TC_ACCT (no --account)
-  // uses the same resolveAccountPin contract — UUID form, mutation-validated,
-  // numeric index rejected — and fails loud on an unresolvable token. NEVER
-  // silently preflight-as-unpinned: that evaluates the wrong candidate set.
-  const accountPinFromFlag = run.accountRequested
-    ? resolveRunAccountPin(config, run.account)
-    : null;
-  const bareTcAcct = accountPinFromFlag ? '' : (process.env.TC_ACCT || '').trim();
-  const accountPin = accountPinFromFlag
-    || (bareTcAcct ? resolveRunAccountPin(config, bareTcAcct) : null);
-
   // Route through the proxy when it's up. When it's down we refuse by default —
   // silently launching claude directly hides that requests are bypassing the
   // proxy (no rotation, spending the user's own quota). Pass --auto-fallback to
   // opt back into the transparent direct launch (e.g. for a dumb shell alias).
   const port = config.proxy.port;
   const env = { ...process.env };
+
+  // Probed BEFORE pin resolution and preflight: with the proxy down
+  // --auto-fallback launches claude straight at the upstream, where the pin is a
+  // proxy routing knob that governs nothing — failing loud on a stale pin there
+  // refuses a session that works, on a rule it will never consult. Same doctrine
+  // as routingApplies for preflight. When the proxy IS up (or proxy-down without
+  // --auto-fallback), keep fail-loud — D12 parity must not regress.
+  const proxyUp = await isProxyUp(port);
+  // Routing governs this launch unless it is the direct one. Note the second
+  // clause: with the proxy down and NO --auto-fallback the run is about to
+  // refuse anyway, and reporting both problems at once beats sending the
+  // operator round the loop twice — start the server, get refused again.
+  const routingApplies = proxyUp || !autoFallback;
+
+  // --account <name> is sugar for TC_ACCT. Resolve the effective pin when
+  // routing applies so a typo costs nothing: an unknown pin would otherwise
+  // reach the server as a 404 on the FIRST request. Bare TC_ACCT (no --account)
+  // uses the same resolveAccountPin contract — UUID form, mutation-validated,
+  // numeric index rejected — and fails loud on an unresolvable token. NEVER
+  // silently preflight-as-unpinned when routing applies. On the direct-fallback
+  // path soft-resolve only (for the "pin IGNORED" narration) — never exit.
+  let accountPinFromFlag = null;
+  let accountPin = null;
+  if (routingApplies) {
+    accountPinFromFlag = run.accountRequested
+      ? resolveRunAccountPin(config, run.account)
+      : null;
+    const bareTcAcct = accountPinFromFlag ? '' : (process.env.TC_ACCT || '').trim();
+    accountPin = accountPinFromFlag
+      || (bareTcAcct ? resolveRunAccountPin(config, bareTcAcct) : null);
+  } else {
+    const token = run.accountRequested
+      ? (run.account || '')
+      : (process.env.TC_ACCT || '').trim();
+    if (token) {
+      accountPin = tryResolveRunAccountPin(config, token);
+      if (accountPin && run.accountRequested) accountPinFromFlag = accountPin;
+    }
+  }
+
   // TC_ACCT is the sole pin mechanism. --account is sugar: it sets the pin
   // identity. Emit the STABLE form (uuid), not the mutable display name — same
   // doctrine as envCommand / stableAccountPin — so a later rename cannot
@@ -809,18 +835,6 @@ async function runCommand() {
   // also pins (shipped in 1.1.10). TC_ACCT is the supported way now — it works in
   // MITM mode too, and keeps the pin out of the API path.
   const pinnedBase = isLocalAccountPin(process.env.ANTHROPIC_BASE_URL, port);
-
-  // Probed BEFORE the preflight, not after: with the proxy down --auto-fallback
-  // launches claude straight at the upstream, where teamclaude's routing table
-  // governs nothing — so refusing that launch on routing grounds would refuse a
-  // session that works, on rules it will never consult. The preflight is told
-  // which rules apply instead of assuming they all do.
-  const proxyUp = await isProxyUp(port);
-  // Routing governs this launch unless it is the direct one. Note the second
-  // clause: with the proxy down and NO --auto-fallback the run is about to
-  // refuse anyway, and reporting both problems at once beats sending the
-  // operator round the loop twice — start the server, get refused again.
-  const routingApplies = proxyUp || !autoFallback;
   // Proxy vars a direct launch inherited and deliberately did NOT clear, so the
   // launch line can qualify its "bypassing the proxy" claim rather than assert
   // something the environment contradicts.
@@ -978,6 +992,19 @@ function resolveConfigAccountPin(config, token) {
   return resolveAccountPin({ accounts: config.accounts || [] }, token);
 }
 
+// Non-fatal pin lookup for the direct-fallback path (proxy down +
+// --auto-fallback), where the pin is ignored and must not exit(1).
+function tryResolveRunAccountPin(config, token) {
+  if (!token) return null;
+  const accounts = config.accounts || [];
+  const index = resolveConfigAccountPin(config, token);
+  if (index == null) return null;
+  const acct = accounts[index];
+  // `pin` is the stable form to EMIT (env / suggested --account); `name` stays
+  // the human-readable label for stderr. See stableAccountPin.
+  return { token, index, name: acct.name, pin: stableAccountPin(acct) };
+}
+
 function resolveRunAccountPin(config, token) {
   const accounts = config.accounts || [];
   const names = accounts.map(a => a.name);
@@ -992,12 +1019,9 @@ function resolveRunAccountPin(config, token) {
 
   if (!token) bail('--account needs an account pin, e.g. --account work');
 
-  const index = resolveConfigAccountPin(config, token);
-  if (index == null) bail(`Unknown account pin "${token}".`);
-  const acct = accounts[index];
-  // `pin` is the stable form to EMIT (env / suggested --account); `name` stays
-  // the human-readable label for stderr. See stableAccountPin.
-  return { token, index, name: acct.name, pin: stableAccountPin(acct) };
+  const resolved = tryResolveRunAccountPin(config, token);
+  if (!resolved) bail(`Unknown account pin "${token}".`);
+  return resolved;
 }
 
 /** POSIX single-quote wrap so an interpolated value cannot break shell text. */

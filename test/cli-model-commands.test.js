@@ -424,6 +424,44 @@ test('D12: unresolvable bare TC_ACCT fails loud at launch (never preflight-as-un
   });
 });
 
+// ── D12b: stale pin must not block --auto-fallback direct launch ─
+//
+// Pin resolution used to run before isProxyUp. With the proxy down and
+// --auto-fallback, a stale --account/TC_ACCT exited 1 even though the pin is
+// ignored on a direct launch. Fail-loud must still hold when the proxy is up.
+
+test('D12b: proxy-down + --auto-fallback + stale pin still launches directly', async () => {
+  await withRun(async ({ run, runWithEnv }) => {
+    const viaFlag = run('--auto-fallback', '--account', 'not-a-real-pin', '--', '-p', 'hi');
+    assert.doesNotMatch(viaFlag.stderr, /Unknown account pin/,
+      `stale --account must not block direct launch:\n${viaFlag.stderr}`);
+    assert.match(viaFlag.stderr, /launching claude directly/);
+    assert.match(viaFlag.stderr, /Claude Code not found in PATH/,
+      'it got as far as spawning — proof the launch was attempted');
+
+    const viaEnv = runWithEnv({ TC_ACCT: 'not-a-real-pin' }, '--auto-fallback', '--', '-p', 'hi');
+    assert.doesNotMatch(viaEnv.stderr, /Unknown account pin/,
+      `stale TC_ACCT must not block direct launch:\n${viaEnv.stderr}`);
+    assert.match(viaEnv.stderr, /launching claude directly/);
+    assert.match(viaEnv.stderr, /Claude Code not found in PATH/);
+  });
+});
+
+test('D12b: proxy-up + stale pin still fails loud', async () => {
+  await withRunEmission(async ({ run, runWithEnv }) => {
+    const viaFlag = run('--account', 'not-a-real-pin', '--', '-p', 'hi');
+    assert.equal(viaFlag.status, 1);
+    assert.match(viaFlag.stderr, /Unknown account pin "not-a-real-pin"/);
+    assert.doesNotMatch(viaFlag.stderr, /Pinned to account|launching claude directly/,
+      'must die at pin resolution before spawn when the proxy is up');
+
+    const viaEnv = runWithEnv({ TC_ACCT: 'not-a-real-pin' }, '--', '-p', 'hi');
+    assert.equal(viaEnv.status, 1);
+    assert.match(viaEnv.stderr, /Unknown account pin "not-a-real-pin"/);
+    assert.doesNotMatch(viaEnv.stderr, /Pinned to account|launching claude directly/);
+  });
+});
+
 test('run --account accepts every stable TC_ACCT identity form', async () => {
   await withRun(async ({ run }) => {
     const cases = [
@@ -568,22 +606,25 @@ async function withRunEmission(fn, configPatch = {}) {
     + 'process.stdout.write(`ANTHROPIC_BASE_URL=${process.env.ANTHROPIC_BASE_URL || ""}\\n`);\n');
   await chmod(claudeShim, 0o755);
 
-  const run = (...argv) => spawnSync(process.execPath, [CLI, 'run', ...argv], {
+  const baseEnv = {
+    ...process.env,
+    PATH: binDir,
+    TEAMCLAUDE_CONFIG: configPath,
+    CLAUDE_CONFIG_DIR: workDir,
+    TEAMCLAUDE_DISABLE_AUTOUPDATE: '1',
+    ANTHROPIC_MODEL: '',
+    TC_ACCT: '',
+  };
+  const spawnRun = (argv, envPatch = {}) => spawnSync(process.execPath, [CLI, 'run', ...argv], {
     cwd: workDir,
     encoding: 'utf8',
-    env: {
-      ...process.env,
-      PATH: binDir,
-      TEAMCLAUDE_CONFIG: configPath,
-      CLAUDE_CONFIG_DIR: workDir,
-      TEAMCLAUDE_DISABLE_AUTOUPDATE: '1',
-      ANTHROPIC_MODEL: '',
-      TC_ACCT: '',
-    },
+    env: { ...baseEnv, ...envPatch },
   });
+  const run = (...argv) => spawnRun(argv);
+  const runWithEnv = (envPatch, ...argv) => spawnRun(argv, envPatch);
 
   try {
-    await fn({ dir, configPath, run, port });
+    await fn({ dir, configPath, run, runWithEnv, port });
   } finally {
     stub.close();
     await rm(dir, { recursive: true, force: true });
