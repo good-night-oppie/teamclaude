@@ -777,12 +777,19 @@ async function runCommand() {
     process.exit(1);
   }
 
-  // --account <name> is sugar for TC_ACCT. Resolve it before anything else so a
-  // typo costs nothing: an unknown pin would otherwise reach the server as a
-  // 404 on the FIRST request, i.e. after claude has already started and the
-  // operator has stopped watching. Bare TC_ACCT (no --account) keeps upstream's
-  // warn-at-proxy behavior for unknown tokens, but still feeds preflight.
-  const accountPin = run.accountRequested ? resolveRunAccountPin(config, run.account) : null;
+  // --account <name> is sugar for TC_ACCT. Resolve the effective pin ONCE
+  // before anything else so a typo costs nothing: an unknown pin would otherwise
+  // reach the server as a 404 on the FIRST request, i.e. after claude has already
+  // started and the operator has stopped watching. Bare TC_ACCT (no --account)
+  // uses the same resolveAccountPin contract — UUID form, mutation-validated,
+  // numeric index rejected — and fails loud on an unresolvable token. NEVER
+  // silently preflight-as-unpinned: that evaluates the wrong candidate set.
+  const accountPinFromFlag = run.accountRequested
+    ? resolveRunAccountPin(config, run.account)
+    : null;
+  const bareTcAcct = accountPinFromFlag ? '' : (process.env.TC_ACCT || '').trim();
+  const accountPin = accountPinFromFlag
+    || (bareTcAcct ? resolveRunAccountPin(config, bareTcAcct) : null);
 
   // Route through the proxy when it's up. When it's down we refuse by default —
   // silently launching claude directly hides that requests are bypassing the
@@ -794,8 +801,9 @@ async function runCommand() {
   // identity. Emit the STABLE form (uuid), not the mutable display name — same
   // doctrine as envCommand / stableAccountPin — so a later rename cannot
   // silently repoint a session. Deleted from the child env so it never leaks
-  // into tools/MCP servers claude spawns.
-  const tcAcct = (accountPin ? accountPin.pin : (process.env.TC_ACCT || '')).trim();
+  // into tools/MCP servers claude spawns. Resolved pins (flag or bare TC_ACCT)
+  // always emit accountPin.pin; there is no unresolved pass-through left.
+  const tcAcct = accountPin ? accountPin.pin : '';
   delete env.TC_ACCT;
   // Legacy: a caller-supplied ANTHROPIC_BASE_URL of http://<this proxy>/tc-acct/…
   // also pins (shipped in 1.1.10). TC_ACCT is the supported way now — it works in
@@ -844,7 +852,7 @@ async function runCommand() {
       env.NO_PROXY = env.no_proxy = 'localhost,127.0.0.1,::1';
       env.NODE_EXTRA_CA_CERTS = caPath;
       if (tcAcct) {
-        const via = accountPin ? `--account ${accountPin.name} → TC_ACCT` : 'TC_ACCT';
+        const via = accountPinFromFlag ? `--account ${accountPinFromFlag.name} → TC_ACCT` : 'TC_ACCT';
         console.error(`[TeamClaude] Pinned to account "${tcAcct}" (${via}) — this session will not rotate and will not fail over; an exhausted pin returns 429 rather than borrowing another account.`);
       } else if (pinnedBase) {
         console.error('[TeamClaude] Account pin in ANTHROPIC_BASE_URL ignored: MITM mode does not use a base URL.');
@@ -860,7 +868,7 @@ async function runCommand() {
       // pointing at this proxy is preserved for configs written against 1.1.10.
       if (tcAcct) {
         env.ANTHROPIC_BASE_URL = `http://localhost:${port}/tc-acct/${encodePinComponent(tcAcct)}`;
-        const via = accountPin ? `--account ${accountPin.name} → TC_ACCT` : 'TC_ACCT';
+        const via = accountPinFromFlag ? `--account ${accountPinFromFlag.name} → TC_ACCT` : 'TC_ACCT';
         console.error(`[TeamClaude] Pinned to account "${tcAcct}" (${via}) — this session will not rotate and will not fail over; an exhausted pin returns 429 rather than borrowing another account.`);
       } else if (!pinnedBase) {
         env.ANTHROPIC_BASE_URL = `http://localhost:${port}`;
@@ -881,8 +889,8 @@ async function runCommand() {
       console.error(`[TeamClaude] NOTE: ${names.join(', ')} = ${value} — set to something that is NOT this proxy, so it is left alone (it may be a corporate egress proxy or another teamclaude). This launch is "direct" only with respect to port ${port}; claude's traffic still traverses that proxy.`);
     }
     directLaunchVia = plan.remaining;
-    if (accountPin || tcAcct) {
-      console.error(`[TeamClaude] account pin (${accountPin ? `--account ${accountPin.name}` : `TC_ACCT=${tcAcct}`}) is IGNORED in a direct launch: the pin is a proxy routing knob, and the proxy is down.`);
+    if (accountPin) {
+      console.error(`[TeamClaude] account pin (${accountPinFromFlag ? `--account ${accountPinFromFlag.name}` : `TC_ACCT=${tcAcct}`}) is IGNORED in a direct launch: the pin is a proxy routing knob, and the proxy is down.`);
     }
   } else {
     console.error(`[TeamClaude] Proxy not running on port ${port}.`);

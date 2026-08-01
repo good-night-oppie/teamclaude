@@ -246,20 +246,25 @@ async function withRun(fn, configPatch = {}) {
   await writeFile(join(dir, 'work', 'settings.json'), JSON.stringify({ availableModels: ['claude-opus-4-8'] }));
 
   // PATH holds nothing, so even an unexpected spawn cannot reach a real claude.
-  const run = (...argv) => spawnSync(process.execPath, [CLI, 'run', ...argv], {
+  // TC_ACCT cleared so a dirty parent env cannot pin these launches by accident.
+  const baseEnv = {
+    ...process.env,
+    PATH: join(dir, 'nothing'),
+    TEAMCLAUDE_CONFIG: configPath,
+    CLAUDE_CONFIG_DIR: join(dir, 'work'),
+    TEAMCLAUDE_DISABLE_AUTOUPDATE: '1',
+    ANTHROPIC_MODEL: '',
+    TC_ACCT: '',
+  };
+  const spawnRun = (argv, envPatch = {}) => spawnSync(process.execPath, [CLI, 'run', ...argv], {
     cwd: join(dir, 'work'),
     encoding: 'utf8',
-    env: {
-      ...process.env,
-      PATH: join(dir, 'nothing'),
-      TEAMCLAUDE_CONFIG: configPath,
-      CLAUDE_CONFIG_DIR: join(dir, 'work'),
-      TEAMCLAUDE_DISABLE_AUTOUPDATE: '1',
-      ANTHROPIC_MODEL: '',
-    },
+    env: { ...baseEnv, ...envPatch },
   });
+  const run = (...argv) => spawnRun(argv);
+  const runWithEnv = (envPatch, ...argv) => spawnRun(argv, envPatch);
   try {
-    await fn({ dir, configPath, run });
+    await fn({ dir, configPath, run, runWithEnv });
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -318,6 +323,104 @@ test('run --account is judged against the pinned account, not the routing table 
     assert.ok(!r.stderr.includes('Refusing to launch'));
     assert.match(r.stderr, /WARNING: account "deepseek-v4-pro" is pinned/);
     assert.match(r.stderr, /Proxy not running/);
+  });
+});
+
+// ── D12: bare TC_ACCT preflight pin parity with --account ─────
+//
+// TC_ACCT is the sole pin mechanism; --account is sugar. Preflight must treat
+// them identically. Before D12, bare TC_ACCT left accountPin=null and judged
+// the unpinned routing table — wrong in both directions.
+
+test('D12: bare TC_ACCT allows a model the pinned account can serve that routing candidates cannot', async () => {
+  // primary is the only routing candidate and is disabled → unpinned refuses.
+  // Pinning deepseek-v4-pro (has modelMap for opus) must allow — the defect was
+  // bare TC_ACCT judging the unpinned table and refusing here.
+  await withRun(async ({ run, runWithEnv }) => {
+    const unpinned = run('--', '--model', 'claude-opus-4-8');
+    assert.equal(unpinned.status, 1);
+    assert.match(unpinned.stderr, /Refusing to launch/);
+
+    const r = runWithEnv({ TC_ACCT: 'deepseek-v4-pro' }, '--', '--model', 'claude-opus-4-8');
+    assert.ok(!r.stderr.includes('Refusing to launch'),
+      `bare TC_ACCT must pin preflight; got:\n${r.stderr}`);
+    assert.match(r.stderr, /WARNING: account "deepseek-v4-pro" is pinned/);
+    assert.match(r.stderr, /Proxy not running/);
+  }, {
+    accounts: [
+      {
+        name: 'primary', type: 'oauth', priority: 0, disabled: true,
+        accountUuid: 'acct-primary', orgUuid: 'org-primary',
+      },
+      {
+        name: 'deepseek-v4-pro', type: 'apikey', apiKey: 'k', priority: 80,
+        accountUuid: 'acct-deepseek', orgUuid: 'org-deepseek',
+        upstream: 'http://127.0.0.1:8084',
+        modelMap: { 'claude-opus-4-8': 'deepseek-v4-pro', 'claude-fable-5': 'deepseek-v4-pro' },
+      },
+    ],
+  });
+});
+
+test('D12: bare TC_ACCT refuses a model the pinned account cannot serve that candidates can', async () => {
+  // Closed adapter pin: primary (oauth) serves claude-opus-4-8 via routes;
+  // deepseek is strictModelMap and cannot translate that id.
+  await withRun(async ({ run, runWithEnv }) => {
+    const unpinned = run('--', '--model', 'claude-opus-4-8');
+    assert.ok(!unpinned.stderr.includes('Refusing to launch'),
+      'unpinned candidates must be able to serve so the refuse is pin-specific');
+
+    const r = runWithEnv({ TC_ACCT: 'deepseek-v4-pro' }, '--', '--model', 'claude-opus-4-8');
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /Refusing to launch/);
+    assert.match(r.stderr, /cannot be served by the pinned account|closed adapter/);
+  }, {
+    accounts: [
+      {
+        name: 'primary', type: 'oauth', priority: 0,
+        accountUuid: 'acct-primary', orgUuid: 'org-primary',
+      },
+      {
+        name: 'deepseek-v4-pro', type: 'apikey', apiKey: 'k', priority: 80,
+        accountUuid: 'acct-deepseek', orgUuid: 'org-deepseek',
+        upstream: 'http://127.0.0.1:8084',
+        strictModelMap: true,
+        acceptsModels: ['deepseek-v4-pro'],
+        modelMap: { 'other-model': 'deepseek-v4-pro' },
+      },
+    ],
+    routes: [
+      { name: 'opus', match: ['*opus*'], accounts: ['primary'] },
+      { name: 'default', match: ['*'], accounts: ['primary'] },
+    ],
+  });
+});
+
+test('D12: --account and bare TC_ACCT produce byte-identical preflight decisions', async () => {
+  await withRun(async ({ run, runWithEnv }) => {
+    const viaFlag = run('--account', 'deepseek-v4-pro', '--', '--model', 'claude-opus-4-8');
+    const viaEnv = runWithEnv({ TC_ACCT: 'deepseek-v4-pro' }, '--', '--model', 'claude-opus-4-8');
+    assert.equal(viaFlag.status, viaEnv.status, 'exit parity');
+    // Strip the pin-origin narration ("--account X → TC_ACCT" vs bare "TC_ACCT")
+    // and the proxy-down line — preflight findings must match exactly.
+    const preflightOnly = (stderr) => stderr
+      .split('\n')
+      .filter((l) => /\[TeamClaude\] (ERROR|WARNING|INFO):/.test(l)
+        || l.includes('Refusing to launch')
+        || l.includes('--force was passed'))
+      .join('\n');
+    assert.equal(preflightOnly(viaFlag.stderr), preflightOnly(viaEnv.stderr),
+      `preflight parity failed.\n--account:\n${viaFlag.stderr}\nTC_ACCT:\n${viaEnv.stderr}`);
+  });
+});
+
+test('D12: unresolvable bare TC_ACCT fails loud at launch (never preflight-as-unpinned)', async () => {
+  await withRun(async ({ runWithEnv }) => {
+    const r = runWithEnv({ TC_ACCT: 'not-a-real-pin' }, '--', '--model', 'claude-opus-4-8');
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /Unknown account pin "not-a-real-pin"/);
+    assert.doesNotMatch(r.stderr, /Refusing to launch|model-not-routable|Proxy not running/,
+      'must die at pin resolution, before unpinned preflight can mis-judge');
   });
 });
 
@@ -475,6 +578,7 @@ async function withRunEmission(fn, configPatch = {}) {
       CLAUDE_CONFIG_DIR: workDir,
       TEAMCLAUDE_DISABLE_AUTOUPDATE: '1',
       ANTHROPIC_MODEL: '',
+      TC_ACCT: '',
     },
   });
 
