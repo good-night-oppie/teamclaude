@@ -96,7 +96,7 @@ export class Prober {
       await new Promise((resolve, reject) => {
         const child = execFile('bash', ['-c', cmd], {
           timeout: this.timeoutMs,
-          env: { ...process.env, HOME: process.env.HOME || require('node:os').homedir() },
+          env: { ...process.env },
         });
         child.on('exit', (code) => {
           this._cmdRuns.set(account.name, Date.now());
@@ -113,7 +113,6 @@ export class Prober {
       const finishedAt = Date.now();
       this._recordAccount(account, { status: 'error', error: err?.message || String(err), startedAt, finishedAt, durationMs: finishedAt - startedAt });
     }
-  }
   }
 
   async probeAccount(account) {
