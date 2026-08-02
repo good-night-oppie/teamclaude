@@ -148,6 +148,13 @@ function makeAccount(acct, index) {
     historyFamily: resolveHistoryFamily(acct),
     acceptsHistoryFamilies: Array.isArray(acct.acceptsHistoryFamilies)
       ? acct.acceptsHistoryFamilies.map(String) : null,
+    // External probe: teamclaude invokes probeCommand (shell) to refresh a
+    // provider whose quota has no API (e.g. Sakana billing-console scrape via
+    // Playwright) and reads the resulting JSON from quotaStateFile.
+    // None/nil by default; drop-in: set these fields on an apikey account in
+    // teamclaude.json and the prober runs the command on its probe interval.
+    probeCommand: acct.probeCommand || null,
+    quotaStateFile: acct.quotaStateFile || null,
     credential: acct.accessToken || acct.apiKey,
     refreshToken: acct.refreshToken || null,
     expiresAt: acct.expiresAt || null,
