@@ -7,6 +7,7 @@
 // scheduler, warmer.js); the proxy is otherwise passive. Unlike keep-warm, this
 // probe reads a zero-spend endpoint and never consumes message quota.
 
+import { execFile } from 'node:child_process';
 import { fetchUsage } from './oauth.js';
 
 export class Prober {
@@ -15,6 +16,9 @@ export class Prober {
     this.intervalMs = intervalMs;
     this.probeFn = probeFn;
     this.timeoutMs = timeoutMs;
+    // per-command min interval (ms): avoids re-executing a probeCommand that
+    // the previous cycle is still running (oneshot, no overlapping).
+    this._cmdRuns = new Map();
     this.log = log;
     this.timer = null;
     this._running = false;
@@ -53,19 +57,61 @@ export class Prober {
     this.nextRunAt = null;
   }
 
-  /** Probe every OAuth account once. Overlapping cycles are skipped. */
+  /** Probe every OAuth account + apikey accounts with probeCommand. Overlapping cycles are skipped. */
   async probeAll() {
     if (this._running) return;
     this._running = true;
     this.lastRunStartedAt = Date.now();
     this.nextRunAt = this.intervalMs > 0 ? this.lastRunStartedAt + this.intervalMs : null;
     try {
-      const accounts = this.am.accounts.filter(account =>
+      const oauth = this.am.accounts.filter(account =>
         account.type === 'oauth' && account.credential && !account.retired && !account.disabled);
-      await Promise.all(accounts.map(account => this.probeAccount(account)));
+      const cmd = this.am.accounts.filter(account =>
+        (account.type === 'apikey') && account.probeCommand && !account.retired && !account.disabled);
+      await Promise.all([
+        ...oauth.map(account => this.probeAccount(account)),
+        ...cmd.map(account => this.probeCommandAccount(account)),
+      ]);
     } finally {
       this.lastRunFinishedAt = Date.now();
       this._running = false;
+    }
+  }
+
+  /** Execute a configured probeCommand for an apikey account. The command
+   *  writes quota state JSON to a file; teamclaude reads the file directly
+   *  (per-account quotaStateFile) and stamps unified-ratelimit headers via
+   *  the anthropic-proxy layer on the next pass.
+   *
+   *  Single-flight: overlapping cycles skip the same command. */
+  async probeCommandAccount(account) {
+    const cmd = (account.probeCommand || '').trim();
+    if (!cmd) return;
+    const last = this._cmdRuns.get(account.name) || 0;
+    const minGap = 120_000;  // 2min cooldown — the external probe writes the file
+    if (Date.now() - last < minGap) return;
+    const startedAt = Date.now();
+    this._recordAccount(account, { status: 'running', startedAt });
+    try {
+      await new Promise((resolve, reject) => {
+        const child = execFile('bash', ['-c', cmd], {
+          timeout: this.timeoutMs,
+          env: { ...process.env },
+        });
+        child.on('exit', (code) => {
+          this._cmdRuns.set(account.name, Date.now());
+          code === 0 ? resolve() : reject(new Error(`probeCommand exit ${code}`));
+        });
+        child.on('error', reject);
+        // Discard stdout/stderr — the probe writes its own file
+        child.stdout?.resume();
+        child.stderr?.resume();
+      });
+      const finishedAt = Date.now();
+      this._recordAccount(account, { status: 'ok', error: null, startedAt, finishedAt, durationMs: finishedAt - startedAt });
+    } catch (err) {
+      const finishedAt = Date.now();
+      this._recordAccount(account, { status: 'error', error: err?.message || String(err), startedAt, finishedAt, durationMs: finishedAt - startedAt });
     }
   }
 
@@ -124,9 +170,11 @@ export class Prober {
       nextRunAt: iso(this.nextRunAt),
       accounts: this.am.accounts.map(account => {
         const status = this.accountStatus.get(account.name);
+        const probeType = account.type === 'oauth' ? 'oauth-usage' : account.probeCommand ? 'probeCommand' : 'not-applicable';
         return {
           name: account.name,
-          status: account.type === 'oauth' ? (status?.status || 'never') : 'not-applicable',
+          type: probeType,
+          status: probeType === 'not-applicable' ? 'not-applicable' : (status?.status || 'never'),
           lastProbedAt: iso(status?.finishedAt),
           startedAt: iso(status?.startedAt),
           durationMs: status?.durationMs ?? null,
