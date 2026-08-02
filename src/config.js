@@ -48,6 +48,11 @@ export function createDefaultConfig() {
     switchThreshold: 0.98,
     holdSeconds: 0,
     distributeSessions: false,
+    routingPolicy: {
+      mode: 'priority-first',
+      preserveSessionAffinity: true,
+      reevaluateMs: 300000,
+    },
     eventLogging: 'hide',
     blockedModels: [],
     accounts: [],

@@ -60,7 +60,8 @@ export class Prober {
     this.lastRunStartedAt = Date.now();
     this.nextRunAt = this.intervalMs > 0 ? this.lastRunStartedAt + this.intervalMs : null;
     try {
-      const accounts = this.am.accounts.filter(account => account.type === 'oauth' && account.credential);
+      const accounts = this.am.accounts.filter(account =>
+        account.type === 'oauth' && account.credential && !account.retired && !account.disabled);
       await Promise.all(accounts.map(account => this.probeAccount(account)));
     } finally {
       this.lastRunFinishedAt = Date.now();

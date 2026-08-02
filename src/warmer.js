@@ -95,7 +95,7 @@ export class Warmer {
   _isWarmTarget(account) {
     if (account.type !== 'oauth' || !account.credential) return false;
     if (account.upstream) return false;
-    if (account.disabled) return false;
+    if (account.retired || account.disabled) return false;
     if (account.status === 'error' || account.status === 'exhausted' || account.status === 'throttled') return false;
     const reset = account.quota?.unified5hReset;
     return !(reset && Date.now() < reset); // a future reset ⇒ session already running

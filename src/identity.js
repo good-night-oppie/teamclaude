@@ -43,6 +43,22 @@ export function emailOf(acct) {
 }
 
 /**
+ * The pin form to EMIT for TC_ACCT / `--account` when a resolved account is known.
+ *
+ * Display names are rewritten in place (email, then ` (Org)` when a second org
+ * appears), so emitting the name would let a later rename silently repoint the
+ * pin. Prefer the stable uuid forms the server already accepts: qualified
+ * `accountUuid/orgUuid` when both exist, bare `accountUuid` next, and the
+ * display name only when no uuid is known (API-key accounts, pre-profile).
+ */
+export function stableAccountPin(acct) {
+  if (!acct) return '';
+  if (acct.accountUuid && acct.orgUuid) return `${acct.accountUuid}/${acct.orgUuid}`;
+  if (acct.accountUuid) return acct.accountUuid;
+  return (acct.name || '').trim();
+}
+
+/**
  * Find accounts matching a name-or-email query, optionally narrowed by org.
  *
  * An exact display-name match wins outright. Otherwise match by email (so

@@ -1,0 +1,32 @@
+[Unit]
+Description=TeamClaude local routing data plane
+Documentation=https://github.com/good-night-oppie/teamclaude
+After=network-online.target anthropic-proxy.service anthropic-proxy-codex.service deepseek-adapter.service anthropic-proxy-kimi.service
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+# Replace __TEAMCLAUDE_BIN__ at install time. The data plane reads the ordinary
+# ~/.config/teamclaude.json; credentials never appear in this unit.
+ExecStart=__TEAMCLAUDE_BIN__ server --headless --log-to %h/.teamclaude/logs
+Restart=always
+RestartSec=2
+TimeoutStartSec=20
+TimeoutStopSec=20
+KillSignal=SIGTERM
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.config %h/.teamclaude %h/.local/state
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+# NO MemoryDenyWriteExecute here: ExecStart is the Node CLI, and MDWE blocks
+# V8's writable->executable JIT transitions, so the process can fail to start.
+# The rest of the hardening set above applies to a JIT runtime without issue.
+
+[Install]
+WantedBy=default.target

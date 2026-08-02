@@ -2,13 +2,13 @@
 
 import { spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { createWriteStream } from 'node:fs';
+import { createWriteStream, readFileSync } from 'node:fs';
 import net from 'node:net';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, loadState, saveState } from './config.js';
 import { AccountManager } from './account-manager.js';
-import { createProxyServer } from './server.js';
+import { createProxyServer, resolveAccountPin } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
-import { sameIdentity, orgKey, matchAccounts } from './identity.js';
+import { sameIdentity, orgKey, matchAccounts, stableAccountPin } from './identity.js';
 import { resolveAccounts } from './resolve-accounts.js';
 import * as alias from './alias.js';
 import { ensureCerts } from './mitm.js';
@@ -18,11 +18,52 @@ import { TUI } from './tui.js';
 import { SxManager } from './sx.js';
 import { autoUpdate, checkForUpdate, currentVersion, runUpdate, installKind, PKG_NAME } from './updater.js';
 import { renderStatus } from './status-renderer.js';
-import { buildClaudeEnvLines, encodePinComponent } from './claude-env.js';
+import { syncAccountsFromDisk, applyTopLevelReload } from './config-reload.js';
+import { buildClaudeEnvLines, encodePinComponent, directLaunchEnvPlan, redactUrlUserinfo } from './claude-env.js';
+import { deriveNamespace } from './model-namespace.js';
+import { explainRouting, formatExplain, launchSummary } from './route-explain.js';
+import {
+  preflightModel, formatPreflight, splitRunArgs, lastValueFlag, readFlagSettingsModels, scanModelArgs,
+  RUN_BOOLEAN_FLAGS,
+} from './model-preflight.js';
+import { readAvailableModels } from './claude-settings.js';
+import { checkConfig, formatFindings, doctorExitCode } from './config-doctor.js';
+import { replayRank, formatRankReplay } from './rank-replay.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
+
+// Usage strings for the multi-form commands. They live ABOVE the dispatch switch
+// rather than beside their handlers because the switch runs during module
+// evaluation: a `const` declared further down is still in its temporal dead zone
+// when a handler reaches it, so `teamclaude route bogus` threw a ReferenceError
+// instead of printing usage. Hoisted function declarations are why the handlers
+// themselves can stay below.
+
+const ROUTE_USAGE = [
+  'Usage: teamclaude route [list]',
+  '       teamclaude route add <name> --match "<glob>[,<glob>]" [--accounts "<name-or-index>[,...]"] [--bucket <quota-bucket>] [--color <name>]',
+  '       teamclaude route rm <name>',
+  '',
+  'A route pins model ids matching its globs to an exclusive set of accounts.',
+  'Omit --accounts to route to all accounts (e.g. just to override --bucket).',
+  '--color (red/green/yellow/blue/magenta/cyan) tints the route\'s inline marker in the TUI.',
+  'First matching route wins. Changes apply to a running server immediately.',
+].join('\n');
+
+const ROUTE_COLORS = ['red', 'green', 'yellow', 'blue', 'magenta', 'cyan'];
+
+const EXPLAIN_USAGE = [
+  'Usage: teamclaude explain <model> [--account <name-or-index>] [--json]',
+  '',
+  'Print the routing decision a request for <model> would follow: blocklist, which',
+  'route wins and which routes it shadows, which accounts are eligible and why the',
+  'rest are not, the failover chain, and the config problems the trace proves.',
+  '--account shows the same trace under a /tc-acct pin (what `run --account` sends).',
+  'Quota-blind and read-only: it explains the config, not the live server.',
+].join('\n');
+
 
 switch (command) {
   case 'server':
@@ -86,6 +127,21 @@ switch (command) {
   case 'route':
   case 'routes':
     await routeCommand();
+    process.exit(0);
+    break;
+  case 'models':
+    await modelsCommand();
+    process.exit(0);
+    break;
+  case 'explain':
+    await explainCommand();
+    process.exit(0);
+    break;
+  case 'doctor':
+    await doctorCommand();
+    break;
+  case 'rank':
+    await rankCommand();
     process.exit(0);
     break;
   case 'update':
@@ -155,7 +211,13 @@ async function serverCommand() {
   }
 
   const threshold = config.switchThreshold || 0.98;
-  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions });
+  const accountManager = new AccountManager(accounts, threshold, {
+    routes: config.routes,
+    ramp: config.stormRamp,
+    distributeSessions: config.distributeSessions,
+    routingPolicy: config.routingPolicy,
+    rotationGate: config.rotationGate,
+  });
 
   // Restore quota observed in a previous run so a restart doesn't lose rotation
   // state (passive — we never call the API to re-learn it). Stale windows are
@@ -165,14 +227,23 @@ async function serverCommand() {
     return null;
   });
   if (savedState?.quota) accountManager.restoreQuotaState(savedState.quota);
+  if (savedState?.shadowDecisions) accountManager.restoreShadowDecisions(savedState.shadowDecisions);
+  if (savedState?.sessionFamilies) accountManager.restoreSessionFamilies(savedState.sessionFamilies);
 
   // With quota restored, pick the best account up front (highest priority /
   // soonest-resetting weekly window) instead of defaulting to the first one.
   accountManager.selectActiveAccount();
 
-  // Periodically persist quota (and once more on shutdown) to the state file.
+  // Periodically persist quota + shadow evidence + sessionFamilies (and once
+  // more on shutdown). sessionFamilies rewrite every 60s even while the gate
+  // is inert (always-on marking) — "zero config ⇒ zero change" scopes to
+  // ROUTING only (T2 design amendment #7).
   const persistQuotaState = () =>
-    saveState({ quota: accountManager.exportQuotaState() })
+    saveState({
+      quota: accountManager.exportQuotaState(),
+      shadowDecisions: accountManager.exportShadowDecisions(),
+      sessionFamilies: accountManager.exportSessionFamilies(),
+    })
       .catch(err => console.error(`[TeamClaude] Failed to save quota state: ${err.message}`));
   let quotaSaveInterval = null;
 
@@ -180,12 +251,15 @@ async function serverCommand() {
   // accounts added externally, e.g. by `teamclaude import` while server is running)
   accountManager.onTokenRefresh((idx, newTokens) => {
     const account = accountManager.accounts[idx];
-    if (!account) return;
-    // Keep config.accounts in sync so TUI saveConfig doesn't clobber fresh tokens
-    if (config.accounts[idx]) {
-      config.accounts[idx].accessToken = newTokens.accessToken;
-      config.accounts[idx].refreshToken = newTokens.refreshToken;
-      config.accounts[idx].expiresAt = newTokens.expiresAt;
+    if (!account || account.retired) return;
+    // Keep config.accounts in sync so TUI saveConfig doesn't clobber fresh tokens.
+    // Match by identity: after D4c tombstone retires, memConfig is compacted and
+    // no longer shares indices with accountManager.accounts.
+    const memIdx = config.accounts.findIndex(a => sameIdentity(a, account));
+    if (memIdx >= 0) {
+      config.accounts[memIdx].accessToken = newTokens.accessToken;
+      config.accounts[memIdx].refreshToken = newTokens.refreshToken;
+      config.accounts[memIdx].expiresAt = newTokens.expiresAt;
     }
     atomicConfigUpdate(diskConfig => {
       // Pick up any new accounts from disk so index matching stays correct
@@ -238,10 +312,10 @@ async function serverCommand() {
   const reloadAccounts = async () => {
     const diskConfig = await loadConfig();
     if (!diskConfig) return 0;
-    const added = await syncAccountsFromDisk(diskConfig, config, accountManager);
-    // Pick up route table edits (teamclaude route …, TUI editor, or a hand edit).
-    config.routes = diskConfig.routes || [];
-    accountManager.setRoutes(config.routes);
+    const added = await syncAccountsFromDisk(diskConfig, config, accountManager, { importCredentials });
+    // Pick up route table + routing-policy edits atomically with account policy.
+    // ABSENT keys preserve the running value (D4b); present keys apply as written.
+    applyTopLevelReload(diskConfig, config, accountManager);
     // Apply an sx.org key/mode change made on disk (e.g. via POST /teamclaude/reload).
     const diskSxKey = diskConfig.sx?.apiKey || null;
     const diskSxMode = diskConfig.sx?.mode || 'always';
@@ -277,8 +351,10 @@ async function serverCommand() {
         // Write in-memory accounts as the authoritative state, preserving
         // extra disk-only fields (e.g. importFrom) where the account still exists.
         // Use live tokens from AccountManager (not the stale config.accounts copy).
-        diskConfig.accounts = config.accounts.map((a, i) => {
-          const am = accountManager.accounts[i];
+        // Identity-match live tokens: manager slots may hold D4c tombstones
+        // whose indices no longer align with the compacted config.accounts list.
+        diskConfig.accounts = config.accounts.map((a) => {
+          const am = accountManager.accounts.find(x => !x.retired && sameIdentity(x, a));
           const live = am ? {
             ...a,
             accessToken: am.credential,
@@ -622,11 +698,23 @@ async function envCommand() {
   const port = config.proxy.port;
   const useMitm = !args.slice(1).includes('--no-mitm');
 
+  // Same --account pin as `run`, validated the same way, so a tool that spawns
+  // claude itself can pin a session too. Validation is not optional here either:
+  // an unresolved pin would 404 on every request of a session that already looks
+  // launched. Both spellings are recognized — an `--account=name` that parsed as
+  // "no pin requested" would print an UNPINNED export line with no warning, and
+  // the caller would eval it believing the shell was pinned.
+  const envAccount = lastValueFlag(args.slice(1), '--account');
+  const accountPin = envAccount.present ? resolveRunAccountPin(config, envAccount.value) : null;
+
   let caPath = null;
   if (useMitm) ({ caPath } = await ensureCerts(upstreamHost(config)));
 
-  // Same pin as `teamclaude run`, so `eval "$(teamclaude env)"` and `run` agree.
-  const account = (process.env.TC_ACCT || '').trim();
+  // TC_ACCT is the sole pin mechanism; --account is sugar that sets it.
+  // Emit the STABLE pin form (uuid), not the mutable display name: a later
+  // rename must not silently repoint an already-eval'd shell at a different
+  // account. Bare TC_ACCT (no --account) is passed through unchanged.
+  const account = (accountPin ? accountPin.pin : (process.env.TC_ACCT || '')).trim();
   const lines = buildClaudeEnvLines({
     port, useMitm, caPath, holdSeconds: config.holdSeconds,
     account, proxyApiKey: config.proxy?.apiKey || '',
@@ -636,14 +724,23 @@ async function envCommand() {
   const mode = useMitm ? 'MITM forward-proxy' : 'base-URL';
   process.stderr.write(`# TeamClaude env: ${mode} mode, localhost:${port}\n`);
   if (account) {
-    process.stderr.write(`# pinned to account "${account}" (TC_ACCT)\n`);
-    // Warn, don't fail: the account list can change before the shell is used,
-    // and this command must stay eval-safe.
-    if (!(config.accounts || []).some((a, i) => a.name === account || String(i) === account)) {
-      process.stderr.write(`# warning: no account named "${account}" in the config — the proxy will refuse this pin\n`);
+    if (accountPin) {
+      process.stderr.write(`# pinned to account "${accountPin.name}" (#${accountPin.index}) via TC_ACCT — no rotation, no failover\n`);
+    } else {
+      process.stderr.write(`# pinned to account "${account}" (TC_ACCT)\n`);
+      // Warn, don't fail: the account list can change before the shell is used,
+      // and this command must stay eval-safe. Use the SAME resolver as TC_ACCT's
+      // server path; a valid UUID/qualified pin is not necessarily a name.
+      if (resolveConfigAccountPin(config, account) == null) {
+        process.stderr.write(`# warning: unknown account pin "${account}" — the proxy will refuse this pin\n`);
+      }
     }
   }
-  process.stderr.write(`# apply to this shell:  eval "$(teamclaude env${useMitm ? '' : ' --no-mitm'})"\n`);
+  // Shell-quote the pin: display names (and even uuid forms pasted into odd
+  // shells) can carry spaces/metacharacters; an unquoted --account would break
+  // or inject into the suggested eval line.
+  const accountArg = accountPin ? ` --account ${shellSingleQuote(accountPin.pin)}` : '';
+  process.stderr.write(`# apply to this shell:  eval "$(teamclaude env${useMitm ? '' : ' --no-mitm'}${accountArg})"\n`);
   if (!(await isProxyUp(port))) {
     process.stderr.write(`# note: proxy not running on port ${port} — start it with: teamclaude server\n`);
   }
@@ -657,19 +754,28 @@ async function envCommand() {
 async function runCommand() {
   const config = await loadOrCreateConfig();
 
-  // Args after 'run'. teamclaude flags (e.g. --no-mitm) are recognized only
-  // before an optional `--` separator; everything after `--` goes verbatim to
+  // Args after 'run'. teamclaude flags (e.g. --no-mitm, --account) are recognized
+  // only before an optional `--` separator; everything after `--` goes verbatim to
   // claude. MITM forward-proxy mode is the default so hardcoded api.anthropic.com
   // endpoints are intercepted too; --no-mitm opts back into base-URL-only routing.
   // --mitm is still accepted (now a no-op) for backward compatibility.
-  const rest = args.slice(1);
-  const sep = rest.indexOf('--');
-  const tcFlags = sep >= 0 ? rest.slice(0, sep) : rest;
-  const useMitm = !tcFlags.includes('--no-mitm');
-  const autoFallback = tcFlags.includes('--auto-fallback');
-  const claudeArgs = sep >= 0
-    ? rest.slice(sep + 1)
-    : rest.filter(a => a !== '--mitm' && a !== '--no-mitm' && a !== '--auto-fallback');
+  const run = splitRunArgs(args.slice(1));
+  const useMitm = run.useMitm;
+  const autoFallback = run.autoFallback;
+  const claudeArgs = run.claudeArgs;
+
+  // An unrecognized flag BEFORE the `--` is provably a mistake: in the separated
+  // form that slice is exclusively teamclaude's, and until now anything we did
+  // not know was dropped without a word — which is how `--account=work` launched
+  // an unpinned session that the operator believed was pinned. (In the
+  // unseparated form an unknown flag is claude's by construction, so this only
+  // ever fires on the separated one, where the fleet aliases pass nothing at all.)
+  if (run.unknownFlags.length) {
+    console.error(`[TeamClaude] Unknown flag(s) for 'teamclaude run': ${run.unknownFlags.join(', ')}`);
+    console.error(`Valid flags before the --: ${[...RUN_BOOLEAN_FLAGS, '--account <name>'].join(', ')}`);
+    console.error('Everything after the -- is passed to claude verbatim.');
+    process.exit(1);
+  }
 
   // Route through the proxy when it's up. When it's down we refuse by default —
   // silently launching claude directly hides that requests are bypassing the
@@ -677,17 +783,70 @@ async function runCommand() {
   // opt back into the transparent direct launch (e.g. for a dumb shell alias).
   const port = config.proxy.port;
   const env = { ...process.env };
-  // TC_ACCT pins this session to one account, in either mode. It is teamclaude's
-  // own knob, so it never reaches the child: claude has no use for it, and an
-  // account name is not something to leak into a subprocess environment that
-  // gets inherited by every tool and MCP server claude spawns.
-  const tcAcct = (process.env.TC_ACCT || '').trim();
+
+  // Probed BEFORE pin resolution and preflight: with the proxy down
+  // --auto-fallback launches claude straight at the upstream, where the pin is a
+  // proxy routing knob that governs nothing — failing loud on a stale pin there
+  // refuses a session that works, on a rule it will never consult. Same doctrine
+  // as routingApplies for preflight. When the proxy IS up (or proxy-down without
+  // --auto-fallback), keep fail-loud — D12 parity must not regress.
+  const proxyUp = await isProxyUp(port);
+  // Routing governs this launch unless it is the direct one. Note the second
+  // clause: with the proxy down and NO --auto-fallback the run is about to
+  // refuse anyway, and reporting both problems at once beats sending the
+  // operator round the loop twice — start the server, get refused again.
+  const routingApplies = proxyUp || !autoFallback;
+
+  // --account <name> is sugar for TC_ACCT. Resolve the effective pin when
+  // routing applies so a typo costs nothing: an unknown pin would otherwise
+  // reach the server as a 404 on the FIRST request. Bare TC_ACCT (no --account)
+  // uses the same resolveAccountPin contract — UUID form, mutation-validated,
+  // numeric index rejected — and fails loud on an unresolvable token. NEVER
+  // silently preflight-as-unpinned when routing applies. On the direct-fallback
+  // path soft-resolve only (for the "pin IGNORED" narration) — never exit.
+  let accountPinFromFlag = null;
+  let accountPin = null;
+  if (routingApplies) {
+    accountPinFromFlag = run.accountRequested
+      ? resolveRunAccountPin(config, run.account)
+      : null;
+    const bareTcAcct = accountPinFromFlag ? '' : (process.env.TC_ACCT || '').trim();
+    accountPin = accountPinFromFlag
+      || (bareTcAcct ? resolveRunAccountPin(config, bareTcAcct) : null);
+  } else {
+    const token = run.accountRequested
+      ? (run.account || '')
+      : (process.env.TC_ACCT || '').trim();
+    if (token) {
+      accountPin = tryResolveRunAccountPin(config, token);
+      if (accountPin && run.accountRequested) accountPinFromFlag = accountPin;
+    }
+  }
+
+  // TC_ACCT is the sole pin mechanism. --account is sugar: it sets the pin
+  // identity. Emit the STABLE form (uuid), not the mutable display name — same
+  // doctrine as envCommand / stableAccountPin — so a later rename cannot
+  // silently repoint a session. Deleted from the child env so it never leaks
+  // into tools/MCP servers claude spawns. Resolved pins (flag or bare TC_ACCT)
+  // always emit accountPin.pin; there is no unresolved pass-through left.
+  const tcAcct = accountPin ? accountPin.pin : '';
   delete env.TC_ACCT;
   // Legacy: a caller-supplied ANTHROPIC_BASE_URL of http://<this proxy>/tc-acct/…
   // also pins (shipped in 1.1.10). TC_ACCT is the supported way now — it works in
   // MITM mode too, and keeps the pin out of the API path.
   const pinnedBase = isLocalAccountPin(process.env.ANTHROPIC_BASE_URL, port);
-  if (await isProxyUp(port)) {
+  // Proxy vars a direct launch inherited and deliberately did NOT clear, so the
+  // launch line can qualify its "bypassing the proxy" claim rather than assert
+  // something the environment contradicts.
+  let directLaunchVia = [];
+
+  // Fail loud on a model that cannot work. Claude Code will not do this: at
+  // launch a refused --model is advisory there — warned in-band, never on
+  // stderr, never fatal — so the only place a bad model can still be made
+  // visible is here, before the process is replaced. --no-preflight skips it.
+  if (run.preflight) runPreflight({ config, run, accountPin, routingApplies });
+
+  if (proxyUp) {
     if (useMitm) {
       // Route ALL of claude's traffic through us as an HTTPS forward proxy, so
       // even hardcoded api.anthropic.com endpoints (e.g. the design MCP) get the
@@ -706,10 +865,12 @@ async function runCommand() {
       env.HTTPS_PROXY = env.HTTP_PROXY = env.https_proxy = env.http_proxy = proxyUrl;
       env.NO_PROXY = env.no_proxy = 'localhost,127.0.0.1,::1';
       env.NODE_EXTRA_CA_CERTS = caPath;
-      if (tcAcct) console.error(`[TeamClaude] Pinned to account "${tcAcct}" (TC_ACCT)`);
-      else if (pinnedBase) {
+      if (tcAcct) {
+        const via = accountPinFromFlag ? `--account ${accountPinFromFlag.name} → TC_ACCT` : 'TC_ACCT';
+        console.error(`[TeamClaude] Pinned to account "${tcAcct}" (${via}) — this session will not rotate and will not fail over; an exhausted pin returns 429 rather than borrowing another account.`);
+      } else if (pinnedBase) {
         console.error('[TeamClaude] Account pin in ANTHROPIC_BASE_URL ignored: MITM mode does not use a base URL.');
-        console.error('[TeamClaude] Use TC_ACCT=<account> instead — it pins in both modes.');
+        console.error('[TeamClaude] Use TC_ACCT=<account> (or --account <name>) instead — it pins in both modes.');
       }
       delete env.ANTHROPIC_BASE_URL;
     } else {
@@ -721,13 +882,32 @@ async function runCommand() {
       // pointing at this proxy is preserved for configs written against 1.1.10.
       if (tcAcct) {
         env.ANTHROPIC_BASE_URL = `http://localhost:${port}/tc-acct/${encodePinComponent(tcAcct)}`;
-        console.error(`[TeamClaude] Pinned to account "${tcAcct}" (TC_ACCT)`);
+        const via = accountPinFromFlag ? `--account ${accountPinFromFlag.name} → TC_ACCT` : 'TC_ACCT';
+        console.error(`[TeamClaude] Pinned to account "${tcAcct}" (${via}) — this session will not rotate and will not fail over; an exhausted pin returns 429 rather than borrowing another account.`);
       } else if (!pinnedBase) {
         env.ANTHROPIC_BASE_URL = `http://localhost:${port}`;
       }
     }
   } else if (autoFallback) {
     console.error(`[TeamClaude] Proxy not running on port ${port} — launching claude directly (--auto-fallback; start it with: teamclaude server)`);
+    // "Directly" has to be true. The child inherits this shell's environment,
+    // and a teamclaude session's shell is usually one teamclaude set up, so
+    // without this the traffic goes straight back into a proxy — the dead one we
+    // just probed, or worse, a different live one. See directLaunchEnvPlan.
+    const plan = directLaunchEnvPlan(env, port);
+    for (const name of plan.clear) delete env[name];
+    if (plan.clear.length) {
+      console.error(`[TeamClaude] Cleared ${plan.clear.join(', ')} — they pointed at the proxy on port ${port}, which is down; a direct launch must not route through it.`);
+    }
+    for (const { names, value } of plan.remaining) {
+      // Redact userinfo: proxy URLs carry credentials (teamclaude embeds its API
+      // key there). Logging the raw value is SECRET_IN_PANE (B62).
+      console.error(`[TeamClaude] NOTE: ${names.join(', ')} = ${redactUrlUserinfo(value)} — set to something that is NOT this proxy, so it is left alone (it may be a corporate egress proxy or another teamclaude). This launch is "direct" only with respect to port ${port}; claude's traffic still traverses that proxy.`);
+    }
+    directLaunchVia = plan.remaining;
+    if (accountPin) {
+      console.error(`[TeamClaude] account pin (${accountPinFromFlag ? `--account ${accountPinFromFlag.name}` : `TC_ACCT=${tcAcct}`}) is IGNORED in a direct launch: the pin is a proxy routing knob, and the proxy is down.`);
+    }
   } else {
     console.error(`[TeamClaude] Proxy not running on port ${port}.`);
     console.error('Start it with: teamclaude server');
@@ -746,6 +926,33 @@ async function runCommand() {
     const API_TIMEOUT_DEFAULT_MS = 600_000;
     const current = parseInt(env.API_TIMEOUT_MS || '0', 10) || API_TIMEOUT_DEFAULT_MS;
     if (current < needed) env.API_TIMEOUT_MS = String(needed);
+  }
+
+  // State where this session's traffic is going, on EVERY launch — the guard
+  // that would have caught the incident this whole path exists for. The
+  // preflight only speaks when it can prove something is broken; it is silent
+  // when routing merely differs from what the operator assumed, which is the
+  // case that actually cost six minutes of wrong-model compute. Printed last so
+  // it reflects the env as finally assembled (pin applied, transport chosen,
+  // direct-launch fallback taken) rather than the intent going in.
+  //
+  // stderr, so a `--print` session's stdout stays pipeable. Wrapped, because a
+  // launch must never fail because its narration did: this line is worth
+  // printing on every launch precisely because it is never load-bearing.
+  if (run.launchLine) {
+    try {
+      const model = scanModelArgs(claudeArgs).effective || process.env.ANTHROPIC_MODEL || null;
+      // Prefer the RESOLVED name (same as preflightModel): a UUID-form
+      // `--account` pin's raw token does not match normalizeAccounts()'s
+      // name/index lookup, which falsely printed "matches NO account".
+      const line = launchSummary(config, {
+        model,
+        accountPin: accountPin?.name || accountPin?.token || null,
+        routingApplies: proxyUp,
+        via: directLaunchVia,
+      });
+      if (line) console.error(`[TeamClaude] ${line}`);
+    } catch { /* narration is never load-bearing */ }
   }
 
   // Use spawnSync so the Node process blocks entirely — behaves like execvp.
@@ -770,6 +977,268 @@ async function runCommand() {
   await autoUpdate({ config }).catch(() => {});
 
   process.exit(result.status ?? 1);
+}
+
+// Resolve `run --account <token>` the same way the server resolves a /tc-acct
+// path segment (resolveAccountPin, server.js:148-156): exact name first, then
+// numeric index. Exits non-zero with the valid NAMES on no match — names only,
+// never a token, key, or email-derived credential.
+// Config-file adapter for the LIVE server's resolveAccountPin (server.js):
+// accepts a plain config object, not a running AccountManager, so the CLI can
+// share the exact same pin-matching contract (accountUuid/orgUuid, accountUuid,
+// orgUuid, display name, display name minus " (Org)") without a socket, a
+// server instance, or a second implementation to keep in sync. Deliberately
+// does NOT accept a numeric rotation index — TC_ACCT never has, because array
+// position is unstable identity (test/account-pin.test.js documents why).
+function resolveConfigAccountPin(config, token) {
+  return resolveAccountPin({ accounts: config.accounts || [] }, token);
+}
+
+// Non-fatal pin lookup for the direct-fallback path (proxy down +
+// --auto-fallback), where the pin is ignored and must not exit(1).
+function tryResolveRunAccountPin(config, token) {
+  if (!token) return null;
+  const accounts = config.accounts || [];
+  const index = resolveConfigAccountPin(config, token);
+  if (index == null) return null;
+  const acct = accounts[index];
+  // `pin` is the stable form to EMIT (env / suggested --account); `name` stays
+  // the human-readable label for stderr. See stableAccountPin.
+  return { token, index, name: acct.name, pin: stableAccountPin(acct) };
+}
+
+function resolveRunAccountPin(config, token) {
+  const accounts = config.accounts || [];
+  const names = accounts.map(a => a.name);
+  const bail = (msg) => {
+    console.error(msg);
+    console.error(names.length
+      ? `Valid accounts: ${names.join(', ')}`
+      : 'No accounts are configured. Add one with: teamclaude login');
+    console.error('Accepted pin forms: accountUuid/orgUuid, accountUuid, orgUuid, or display name/email.');
+    process.exit(1);
+  };
+
+  if (!token) bail('--account needs an account pin, e.g. --account work');
+
+  const resolved = tryResolveRunAccountPin(config, token);
+  if (!resolved) bail(`Unknown account pin "${token}".`);
+  return resolved;
+}
+
+/** POSIX single-quote wrap so an interpolated value cannot break shell text. */
+function shellSingleQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+// The fail-loud launch check. Reads Claude Code's settings tiers READ-ONLY and
+// takes nothing from them but the availableModels array; the decision itself is
+// pure and lives in model-preflight.js. Prints to stderr so a `--print` session's
+// stdout stays clean, and exits 1 rather than spawning when a model provably
+// cannot route (the asymmetry between that and the advisory client-gate warning
+// is argued in model-preflight.js's header).
+//
+// `accountPin` and `routingApplies` are what keep the check honest about WHICH
+// rules govern the launch it is judging. A pinned session bypasses selection
+// entirely, and a proxy-down --auto-fallback launch bypasses teamclaude
+// entirely; in neither case may the unpinned routing table refuse anything.
+//
+// The `--settings` scan is the same read-only discipline one level further out:
+// that flag is a settings tier too, and its availableModels union in, so a
+// client-allowlist veto computed without it can assert a fallback that provably
+// will not happen — and then recommend, as the fix, the flag already present in
+// the command line it just judged.
+function runPreflight({ config, run, accountPin = null, routingApplies = true }) {
+  const settings = readAvailableModels();
+  for (const e of settings.errors) {
+    console.error(`[TeamClaude] WARNING: could not parse ${e.path} (${e.message}) — its availableModels entries were skipped.`);
+  }
+  const decision = preflightModel({
+    config,
+    claudeArgs: run.claudeArgs,
+    envModel: process.env.ANTHROPIC_MODEL || null,
+    availableModels: settings.availableModels,
+    flagSettings: readFlagSettingsModels(run.claudeArgs, p => readFileSync(p, 'utf8')),
+    policyOverride: settings.policyOverride,
+    accountPin,
+    routingApplies,
+    misplacedFlags: run.misplacedFlags,
+    force: run.force,
+    strict: run.strict,
+  });
+  for (const line of formatPreflight(decision)) console.error(`[TeamClaude] ${line}`);
+  if (decision.blocked) process.exit(1);
+}
+
+// ── models ──────────────────────────────────────────────────
+
+// `teamclaude models [--json]` — the model ids this proxy can actually route.
+// A query command: loadConfig (never loadOrCreateConfig, which would print and
+// write), payload on stdout, every caveat on stderr so the list stays pipeable.
+// The list is deliberately NOT presented as complete — that framing is what
+// produced the incident this branch exists for — so the un-enumerable half
+// (route globs, passthrough accounts) is printed beside it, not instead of it.
+async function modelsCommand() {
+  const config = await loadConfig();
+  if (!config) {
+    process.stderr.write(`No config found at ${getConfigPath()}. Add an account first: teamclaude login\n`);
+    process.exit(1);
+  }
+  const ns = deriveNamespace(config);
+
+  if (args.includes('--json')) {
+    process.stdout.write(`${JSON.stringify(ns, null, 2)}\n`);
+    return;
+  }
+
+  if (ns.concrete.length) {
+    process.stdout.write(`${ns.concrete.join('\n')}\n`);
+  } else {
+    process.stderr.write('# no model id is named anywhere in this config (no modelMap keys, no models[] claims)\n');
+  }
+  if (ns.patterns.length) {
+    process.stderr.write(`# ${ns.patterns.length} glob pattern(s) also match, and cannot be enumerated: ${ns.patterns.join(', ')}\n`);
+  }
+  for (const note of ns.notes) {
+    for (const line of wrapForStderr(note, 96)) process.stderr.write(`# ${line}\n`);
+  }
+  process.stderr.write('# check any single id, listed or not:  teamclaude explain <model>\n');
+}
+
+// ── explain ─────────────────────────────────────────────────
+
+async function explainCommand() {
+  const model = args[1] && !args[1].startsWith('-') ? args[1] : null;
+  if (!model) {
+    console.error(EXPLAIN_USAGE);
+    process.exit(1);
+  }
+  const config = await loadConfig();
+  if (!config) {
+    console.error(`No config found at ${getConfigPath()}. Add an account first: teamclaude login`);
+    process.exit(1);
+  }
+  const trace = explainRouting(config, model, { account: lastValueFlag(args.slice(1), '--account').value });
+  if (args.includes('--json')) {
+    process.stdout.write(`${JSON.stringify(trace, null, 2)}\n`);
+    return;
+  }
+  console.log(formatExplain(trace));
+}
+
+// ── doctor ──────────────────────────────────────────────────
+
+// `teamclaude doctor` — a read-only consistency check over the config, plus an
+// optional cross-check against Claude Code's own availableModels allowlist. It
+// exists to be run unattended, so it exits with a code that distinguishes
+// outcomes instead of the repo's usual 0/1: 0 clean, 2 warnings, 3 errors, and
+// 1 for "could not run at all". That deviation is deliberate and documented in
+// showHelp — automation must be able to tell a bad config from a bad invocation.
+// Never writes anything: not the teamclaude config, and certainly not Claude
+// Code's settings, which are opened read-only and yield nothing but the
+// availableModels array.
+async function doctorCommand() {
+  const json = args.includes('--json');
+  const strict = args.includes('--strict');
+  const config = await loadConfig();
+  if (!config) {
+    console.error(`No config found at ${getConfigPath()}. Add an account first: teamclaude login`);
+    process.exit(1);
+  }
+
+  const settingsPath = argValue('--claude-settings');
+  let settings;
+  try {
+    settings = settingsPath
+      ? readAvailableModelsFromFile(settingsPath)
+      : readAvailableModels();
+  } catch (err) {
+    console.error(`Cannot read ${settingsPath}: ${err?.message || err}`);
+    process.exit(1);
+  }
+
+  const findings = checkConfig(config, {
+    availableModels: settings.availableModels,
+    settingsSources: settings.sources,
+  });
+  const code = doctorExitCode(findings, { strict });
+
+  if (json) {
+    process.stdout.write(`${JSON.stringify({
+      exitCode: code,
+      findings,
+      clientAllowlist: {
+        entries: settings.availableModels ? settings.availableModels.length : null,
+        sources: settings.sources.map(s => ({ tier: s.tier, path: s.path, count: s.count })),
+        policyOverride: settings.policyOverride,
+        errors: settings.errors,
+      },
+    }, null, 2)}\n`);
+    process.exit(code);
+  }
+
+  for (const e of settings.errors) console.error(`Warning: could not parse ${e.path} (${e.message})`);
+  console.log(`Config: ${getConfigPath()}`);
+  console.log(settings.sources.length
+    ? `Claude Code allowlist: ${settings.availableModels.length} entry(ies) from ${settings.sources.map(s => s.path).join(', ')}${settings.policyOverride ? ' (managed policy replaced the union)' : ''}`
+    : 'Claude Code allowlist: not configured in any settings tier (the client admits any model id)');
+  console.log('');
+  console.log(formatFindings(findings, { strict }).join('\n'));
+  process.exit(code);
+}
+
+// `teamclaude rank <model>` — offline evidence for a shadow→dynamic promotion
+// decision. Loads config + the persisted quota snapshot (config.js state file,
+// the same one restored on server start) and computes what legacy AND dynamic
+// mode would choose right now, without making any request or mutating state.
+// This is the safe way to validate dynamic ranking: it replays real, already-
+// collected quota evidence rather than sending duplicate authenticated OAuth
+// traffic through a second process, which can trip the same per-minute
+// rate-limit a live session is using.
+async function rankCommand() {
+  const model = args[1];
+  const json = args.includes('--json');
+  if (!model || model.startsWith('--')) {
+    console.error('Usage: teamclaude rank <model> [--json]');
+    process.exit(1);
+  }
+  const config = await loadConfig();
+  if (!config) {
+    console.error(`No config found at ${getConfigPath()}. Add an account first: teamclaude login`);
+    process.exit(1);
+  }
+  const saved = await loadState().catch(() => null);
+  const result = replayRank(config, saved?.quota || null, model);
+  if (json) { console.log(JSON.stringify(result, null, 2)); return; }
+  console.log(formatRankReplay(result));
+}
+
+// A single settings file named explicitly, for checking a config that is not
+// this host's. Same contract as readAvailableModels: availableModels only.
+function readAvailableModelsFromFile(path) {
+  const parsed = JSON.parse(readFileSync(path, 'utf8'));
+  const list = parsed && Array.isArray(parsed.availableModels)
+    ? parsed.availableModels.filter(m => typeof m === 'string')
+    : null;
+  return {
+    availableModels: list,
+    sources: list ? [{ tier: 'explicit', path, count: list.length }] : [],
+    errors: [],
+    policyOverride: false,
+  };
+}
+
+// Greedy wrap for the `#`-prefixed stderr commentary; never splits a token.
+function wrapForStderr(text, width) {
+  const words = String(text).split(/\s+/).filter(Boolean);
+  const out = [];
+  let line = words.shift() || '';
+  for (const w of words) {
+    if (line.length + 1 + w.length > width) { out.push(line); line = w; }
+    else line += ` ${w}`;
+  }
+  out.push(line);
+  return out;
 }
 
 // ── status ──────────────────────────────────────────────────
@@ -1134,19 +1603,6 @@ async function removeCommand() {
 
 // ── route ───────────────────────────────────────────────────
 
-const ROUTE_USAGE = [
-  'Usage: teamclaude route [list]',
-  '       teamclaude route add <name> --match "<glob>[,<glob>]" [--accounts "<name-or-index>[,...]"] [--bucket <quota-bucket>] [--color <name>]',
-  '       teamclaude route rm <name>',
-  '',
-  'A route pins model ids matching its globs to an exclusive set of accounts.',
-  'Omit --accounts to route to all accounts (e.g. just to override --bucket).',
-  '--color (red/green/yellow/blue/magenta/cyan) tints the route\'s inline marker in the TUI.',
-  'First matching route wins. Changes apply to a running server immediately.',
-].join('\n');
-
-const ROUTE_COLORS = ['red', 'green', 'yellow', 'blue', 'magenta', 'cyan'];
-
 function splitList(value) {
   return (value || '').split(',').map(s => s.trim()).filter(Boolean);
 }
@@ -1296,15 +1752,18 @@ Commands:
   login --api         Add an API key account
   env [--no-mitm]     Print export lines to point Claude Code at the proxy, for
                       'eval "$(teamclaude env)"' (MITM forward-proxy by default;
-                      --no-mitm for base-URL only). Handy for agent multiplexers
-                      that spawn claude themselves instead of via 'teamclaude run'
-  run [--no-mitm] [--auto-fallback] [-- args...]
+                      --no-mitm for base-URL only; --account <name> to pin).
+                      Handy for agent multiplexers that spawn claude themselves
+                      instead of via 'teamclaude run'
+  run [--account <name>] [--no-mitm] [--auto-fallback] [-- args...]
                       Run Claude Code through the proxy (errors if it's down,
                       unless --auto-fallback launches claude directly instead).
                       Routes via an HTTPS forward proxy + local CA by default, so
                       even hardcoded api.anthropic.com endpoints are intercepted;
-                      --no-mitm uses base-URL routing only. Set TC_ACCT to pin
-                      the session to one account (see Environment below)
+                      --no-mitm uses base-URL routing only. Set TC_ACCT (or
+                      --account <name>, which sets it) to pin the session to one
+                      account; the model in '-- --model <id>' is checked before
+                      claude starts (see Environment below)
   alias               Print a shell alias so plain 'claude' routes via the proxy
                       (--install to write it to your shell rc; --uninstall to remove)
   status [--json]     Show rich proxy/account/probe status (live)
@@ -1316,6 +1775,20 @@ Commands:
   priority <name> <n> Set rotation priority (lower = preferred; --first/--last)
   route [list|add|rm] Per-model routing: pin model globs to specific accounts
                       (add <name> --match "<glob>" [--accounts "<name>"] [--bucket <b>])
+  models [--json]     List the model ids this proxy can actually route, derived
+                      from routes, per-account 'models' claims, and modelMap keys
+                      (never a complete list — globs and passthrough accounts
+                      serve ids that appear nowhere in the config)
+  explain <model>     Show how a request for <model> would route: which route
+                      wins, which routes it shadows, which accounts are eligible
+                      and why the rest are not, and the failover chain
+                      (--account <name> traces it under a pin; --json)
+  doctor [--json]     Check routes, modelMap keys, models[] claims and Claude
+                      Code's availableModels for dead or conflicting config
+                      (--strict, --claude-settings <file>; exit codes below)
+  rank <model>        Offline legacy-vs-dynamic routing decision, replayed from
+                      the persisted quota snapshot (no request, no mutation;
+                      --json). Evidence for a shadow -> dynamic promotion.
   probe [off|secs]    Opt-in background quota refresh for idle accounts
                       (off by default; reads usage endpoint, spends no quota)
   warmup [off|secs]   Opt-in: keep idle accounts' 5h timers running by sending
@@ -1338,6 +1811,22 @@ Options:
   --no-mitm           (run) skip the forward proxy; route via ANTHROPIC_BASE_URL only
   --auto-fallback     (run) if the proxy is down, launch claude directly instead
                       of erroring out (bypasses the proxy: no rotation)
+  --account NAME      (run/env) sugar for TC_ACCT: pin the session to one
+                      account — no rotation, no failover (account name or index;
+                      --account=N works too; index is resolved to the account
+                      name before setting TC_ACCT). A pinned launch is checked
+                      against THAT account, not the routing rules the pin bypasses
+  --force             (run) launch anyway despite the one blocking preflight
+                      finding (a model that provably cannot route). teamclaude's
+                      own flag, so it must come BEFORE the '--' separator
+  --strict            (run) also block when Claude Code's own availableModels
+                      would veto the model; (doctor) exit 3 on warnings too
+  --no-preflight      (run) skip the model check before launching claude
+  --no-launch-line    (run) suppress the one-line summary of where this session's
+                      traffic will go, printed on stderr before claude starts
+  --claude-settings FILE
+                      (doctor) cross-check against this settings file instead of
+                      the ones Claude Code would load (read-only, either way)
 
 Environment:
   TC_ACCT             Pin a session to ONE account, bypassing rotation. Works in
@@ -1348,13 +1837,30 @@ Environment:
                       rewritten when an email gains a second org. Read by 'run'
                       and 'env', then removed from the environment so it never
                       reaches claude or the tools it spawns. An unknown account
-                      is refused rather than silently rotated.
+                      is refused rather than silently rotated. '--account <name>'
+                      is sugar for the same pin (resolves index→name, then sets
+                      TC_ACCT for the launch).
   TEAMCLAUDE_CONFIG   Path to the config file (default below)
   TEAMCLAUDE_DISABLE_AUTOUPDATE=1
                       Skip the background self-update check
 
 The server always accepts both base-URL and proxy/CONNECT clients, so instances
 launched with and without --no-mitm can share one server.
+
+'run' checks the model before it starts claude, because Claude Code will not: a
+--model it refuses is advisory at launch — warned in-band, never on stderr,
+never fatal — so a session silently runs on the default model instead. Exactly
+ONE thing blocks a launch: a model this proxy provably cannot serve (--force
+overrides, before the '--'). A repeated --model warns and names the winner but
+never blocks — a wrapper appending a second one is how an override is expressed.
+A model only Claude Code's own allowlist would veto warns in one line, since
+that mirrors one client build (--strict promotes it). An account name is not a
+model id — use --account, which is also what the preflight then checks against.
+
+'doctor' exits 0 clean, 2 warnings, 3 errors, and 1 when it could not run at all
+(no config, unreadable file, bad usage), so a cron job can tell a bad config
+from a bad invocation. teamclaude never writes ~/.claude/settings.json; doctor
+opens it read-only and reads nothing from it but availableModels.
 
 A running server re-syncs accounts from config on POST /teamclaude/reload
 (local only). add/login/enable/disable/priority trigger it automatically.
@@ -1453,84 +1959,6 @@ function findConfigAccount(diskConfig, account) {
  * for existing ones (handles re-imported OAuth tokens, rotated API keys, etc.).
  * Returns the number of new accounts added.
  */
-async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
-  let added = 0;
-  // Greedy 1:1 pairing of disk entries to in-memory accounts, account+org aware.
-  // Each disk entry claims at most one unclaimed manager account, so multiple
-  // same-person/different-org entries pair correctly instead of all matching the
-  // first one with that accountUuid.
-  const claimed = new Set();
-  const claim = (diskAcct) => {
-    for (let i = 0; i < accountManager.accounts.length; i++) {
-      if (!claimed.has(i) && sameIdentity(accountManager.accounts[i], diskAcct)) {
-        claimed.add(i);
-        return i;
-      }
-    }
-    return -1;
-  };
-
-  for (const diskAcct of diskConfig.accounts) {
-    const mgrIdx = claim(diskAcct);
-
-    if (mgrIdx < 0) {
-      // New account discovered on disk — add to running server
-      memConfig.accounts.push(diskAcct);
-      accountManager.addAccount(diskAcct);
-      claimed.add(accountManager.accounts.length - 1);
-      added++;
-      console.log(`[TeamClaude] Picked up new account "${diskAcct.name}" from config`);
-      continue;
-    }
-
-    const mgr = accountManager.accounts[mgrIdx];
-
-    // Backfill org identity and pick up renames/priority onto the running
-    // account (e.g. after disk-side org disambiguation or a `priority` change).
-    if (diskAcct.orgUuid && !mgr.orgUuid) mgr.orgUuid = diskAcct.orgUuid;
-    if (diskAcct.orgName && !mgr.orgName) mgr.orgName = diskAcct.orgName;
-    if (diskAcct.name && mgr.name !== diskAcct.name) mgr.name = diskAcct.name;
-    if (diskAcct.priority != null && mgr.priority !== diskAcct.priority) mgr.priority = diskAcct.priority;
-    // Pick up enable/disable toggles; re-enabling clears a stuck error state.
-    const wantDisabled = !!diskAcct.disabled;
-    if (mgr.disabled !== wantDisabled) accountManager.setDisabled(mgr.index, wantDisabled);
-
-    // Existing account — resolve fresh credentials from disk
-    let freshCred = null;
-    if (diskAcct.type === 'oauth' && diskAcct.importFrom) {
-      try {
-        const creds = await importCredentials(diskAcct.importFrom);
-        freshCred = { accessToken: creds.accessToken, refreshToken: creds.refreshToken, expiresAt: creds.expiresAt };
-      } catch (err) {
-        console.error(`[TeamClaude] Re-import failed for "${diskAcct.name}": ${err.message}`);
-      }
-    } else if (diskAcct.type === 'oauth' && diskAcct.accessToken) {
-      freshCred = { accessToken: diskAcct.accessToken, refreshToken: diskAcct.refreshToken, expiresAt: diskAcct.expiresAt };
-    } else if (diskAcct.type === 'apikey' && diskAcct.apiKey) {
-      freshCred = { apiKey: diskAcct.apiKey };
-    }
-
-    if (!freshCred) continue;
-
-    if (freshCred.accessToken) {
-      const changed = mgr.credential !== freshCred.accessToken ||
-        mgr.refreshToken !== freshCred.refreshToken;
-      // Don't overwrite in-memory credentials with staler ones from disk
-      // (e.g. after a TUI import updated the AM before saveConfig wrote to disk)
-      const diskIsStaler = freshCred.expiresAt && mgr.expiresAt &&
-        freshCred.expiresAt < mgr.expiresAt;
-      if (changed && !diskIsStaler) {
-        accountManager.updateAccountTokens(mgr.index, freshCred);
-        console.log(`[TeamClaude] Refreshed credentials for "${mgr.name}"`);
-      }
-    } else if (freshCred.apiKey && mgr.credential !== freshCred.apiKey) {
-      mgr.credential = freshCred.apiKey;
-      if (mgr.status === 'error') mgr.status = 'active';
-      console.log(`[TeamClaude] Updated API key for "${mgr.name}"`);
-    }
-  }
-  return added;
-}
 
 // ── helpers ─────────────────────────────────────────────────
 
