@@ -7,6 +7,7 @@ import { registerBuildFeature } from './build-identity.js';
 import { RotationLedger, resolveHistoryFamily } from './rotation-ledger.js';
 
 registerBuildFeature('dynamic-routing');
+registerBuildFeature('dynrank-model-fidelity');
 
 // Re-exported for callers that import these model helpers from here.
 export { isFableModel, parseRequestModel, parseAdvisorModel } from './model.js';
@@ -148,6 +149,27 @@ function makeAccount(acct, index) {
     historyFamily: resolveHistoryFamily(acct),
     acceptsHistoryFamilies: Array.isArray(acct.acceptsHistoryFamilies)
       ? acct.acceptsHistoryFamilies.map(String) : null,
+    // External probe: teamclaude invokes probeCommand (shell) to refresh a
+    // provider whose quota has no API (e.g. Sakana billing-console scrape via
+    // Playwright) and reads the resulting JSON from quotaStateFile.
+    // None/nil by default; drop-in: set these fields on an apikey account in
+    // teamclaude.json and the prober runs the command on its probe interval.
+    probeCommand: acct.probeCommand || null,
+    quotaStateFile: acct.quotaStateFile || null,
+    // Native quota source: the in-process replacement for probeCommand. When
+    // set, teamclaude probes the provider directly (no shell, no external
+    // state file, no systemd) via the built-in implementation in
+    // quota-sources.js, keyed by quotaSource.type. This account's unified
+    // quota is then authoritative from the native probe — response-header
+    // unified values are ignored (see updateQuota). Mutually exclusive with
+    // probeCommand: an account declares one quota authority.
+    quotaSource: acct.quotaSource || null,
+    // Model fidelity hint for dynrank. When unset it is DETECTED from the
+    // modelMap (identity = faithful, remap = translated) or the account type
+    // (oauth = native Anthropic = faithful; apikey = opaque adapter =
+    // translated). Set `fidelity: 'faithful' | 'translated'` only to override
+    // the detection for an account the heuristic would misclassify.
+    fidelity: acct.fidelity || null,
     credential: acct.accessToken || acct.apiKey,
     refreshToken: acct.refreshToken || null,
     expiresAt: acct.expiresAt || null,
@@ -1703,13 +1725,38 @@ export class AccountManager {
     return account.costTier;
   }
 
-  /** Dynamic order: hard economic/quality tier for THIS route, then use-or-lose
-   * reset windows, then remaining capacity, with static priority only as a
-   * deterministic final tie. */
+  /** Fidelity of an account for a requested model: does it serve the model
+   *  AS-IS (faithful) or translate it to a different model (translated)?
+   *  Lower rank = more faithful (0 = faithful, 1 = translated).
+   *  Detection: an explicit `fidelity` hint wins; else a modelMap entry is
+   *  faithful iff identity (X→X); else an account with no modelMap is faithful
+   *  iff oauth (native Anthropic) — an apikey account routes through an opaque
+   *  adapter (codex, antigravity) and is treated as translated. */
+  _fidelityRank(account, model) {
+    if (!account || !model) return 0;
+    if (account.fidelity === 'faithful') return 0;
+    if (account.fidelity === 'translated') return 1;
+    const mapped = account.modelMap
+      && Object.prototype.hasOwnProperty.call(account.modelMap, model)
+      ? account.modelMap[model] : null;
+    if (mapped != null) return mapped === model ? 0 : 1;
+    return account.type === 'oauth' ? 0 : 1;
+  }
+
+  /** Dynamic order: hard economic/quality tier for THIS route, then MODEL
+   * FIDELITY (honor the user's model selection — faithful accounts serve the
+   * requested model as-is and outrank translators), then use-or-lose reset
+   * windows, then remaining capacity, with static priority only as a
+   * deterministic final tie. A faithful account that is exhausted or otherwise
+   * unavailable is already filtered by _isAvailable, so the translator is
+   * picked only as the fallback the user asked for. */
   dynamicCompare(a, b, model, now = Date.now()) {
     const ta = this._costTierFor(a, model);
     const tb = this._costTierFor(b, model);
     if (ta !== tb) return ta - tb;
+    const fa = this._fidelityRank(a, model);
+    const fb = this._fidelityRank(b, model);
+    if (fa !== fb) return fa - fb;
     const wa = this._completeWeeklyReset(a, model, now);
     const wb = this._completeWeeklyReset(b, model, now);
     if (wa !== wb) return wa - wb;
@@ -1735,6 +1782,7 @@ export class AccountManager {
       account: account.name,
       routeTier: this._costTierFor(account, model),
       accountCostTier: account.costTier,
+      fidelity: this._fidelityRank(account, model) === 0 ? 'faithful' : 'translated',
       priority: account.priority || 0,
       weeklyReset: Number.isFinite(weeklyReset) ? weeklyReset : null,
       sessionReset: Number.isFinite(sessionReset) ? sessionReset : null,
@@ -1749,6 +1797,7 @@ export class AccountManager {
   _shadowDiffReason(legacy, dynamic, model, now = Date.now()) {
     if (!legacy || !dynamic || legacy.index === dynamic.index) return 'equal';
     if (this._costTierFor(legacy, model) !== this._costTierFor(dynamic, model)) return 'tier';
+    if (this._fidelityRank(legacy, model) !== this._fidelityRank(dynamic, model)) return 'fidelity';
     if (this._completeWeeklyReset(legacy, model, now)
       !== this._completeWeeklyReset(dynamic, model, now)) return 'weekly';
     if (this._completeSessionReset(legacy, now)
@@ -1964,6 +2013,11 @@ export class AccountManager {
   updateQuota(accountIndex, headers) {
     const account = this.accounts[accountIndex];
     if (!account) return;
+
+    // Native quotaSource is the single authority for this account's unified
+    // quota. Skip header parsing so an adapter-stamped value cannot fight the
+    // in-process probe (which is fresher and runs on the probe cadence).
+    if (account.quotaSource) return;
 
     // Unified rate limits (Claude Max)
     const u5h = parseFloat(headers['anthropic-ratelimit-unified-5h-utilization']);
