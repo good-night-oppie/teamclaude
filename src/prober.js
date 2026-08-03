@@ -9,6 +9,7 @@
 
 import { execFile } from 'node:child_process';
 import { fetchUsage } from './oauth.js';
+import { fetchQuotaFor } from './quota-sources.js';
 
 export class Prober {
   constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, timeoutMs = 10_000, log = console.log } = {}) {
@@ -68,9 +69,12 @@ export class Prober {
         account.type === 'oauth' && account.credential && !account.retired && !account.disabled);
       const cmd = this.am.accounts.filter(account =>
         (account.type === 'apikey') && account.probeCommand && !account.retired && !account.disabled);
+      const src = this.am.accounts.filter(account =>
+        (account.type === 'apikey') && account.quotaSource && !account.retired && !account.disabled);
       await Promise.all([
         ...oauth.map(account => this.probeAccount(account)),
         ...cmd.map(account => this.probeCommandAccount(account)),
+        ...src.map(account => this.probeQuotaSourceAccount(account)),
       ]);
     } finally {
       this.lastRunFinishedAt = Date.now();
@@ -112,6 +116,48 @@ export class Prober {
     } catch (err) {
       const finishedAt = Date.now();
       this._recordAccount(account, { status: 'error', error: err?.message || String(err), startedAt, finishedAt, durationMs: finishedAt - startedAt });
+    }
+  }
+
+  /** Probe an apikey account's built-in native quota source (account.quotaSource).
+   *  Runs in-process — no shell, no external state file — and applies the
+   *  result via applyUsageData. On error the account's existing quota is left
+   *  untouched (fail-safe: unknown ranks at Infinity, never 0% used). */
+  async probeQuotaSourceAccount(account) {
+    const startedAt = Date.now();
+    this._recordAccount(account, { status: 'running', startedAt });
+    try {
+      const usage = await this._withTimeout(
+        fetchQuotaFor(account.quotaSource, { switchThreshold: this.am.switchThreshold }));
+      if (!usage || usage.error) {
+        const finishedAt = Date.now();
+        this._recordAccount(account, {
+          status: usage?.error ? 'error' : 'timeout',
+          error: usage?.error || 'quota source probe timed out',
+          startedAt,
+          finishedAt,
+          durationMs: finishedAt - startedAt,
+        });
+        return;
+      }
+      this.am.applyUsageData(account.index, usage);
+      const finishedAt = Date.now();
+      this._recordAccount(account, {
+        status: 'ok',
+        error: null,
+        startedAt,
+        finishedAt,
+        durationMs: finishedAt - startedAt,
+      });
+    } catch (err) {
+      const finishedAt = Date.now();
+      this._recordAccount(account, {
+        status: 'error',
+        error: err?.message || String(err),
+        startedAt,
+        finishedAt,
+        durationMs: finishedAt - startedAt,
+      });
     }
   }
 
@@ -170,7 +216,10 @@ export class Prober {
       nextRunAt: iso(this.nextRunAt),
       accounts: this.am.accounts.map(account => {
         const status = this.accountStatus.get(account.name);
-        const probeType = account.type === 'oauth' ? 'oauth-usage' : account.probeCommand ? 'probeCommand' : 'not-applicable';
+        const probeType = account.type === 'oauth' ? 'oauth-usage'
+          : account.probeCommand ? 'probeCommand'
+          : account.quotaSource ? 'quotaSource'
+          : 'not-applicable';
         return {
           name: account.name,
           type: probeType,

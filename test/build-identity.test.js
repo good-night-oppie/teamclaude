@@ -20,6 +20,7 @@ function close(server) {
 const EXPECTED_FEATURES = [
   'audit-b1-b6',
   'dynamic-routing',
+  'dynrank-model-fidelity',
   'ingress-collision-gate',
   'ingress-thinking-strip',
   'model-preflight',
