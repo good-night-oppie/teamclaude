@@ -416,7 +416,10 @@ async function serverCommand() {
       const dur = r ? ((Date.now() - r.started) / 1000).toFixed(1) : '?';
       const acct = info.account || r?.account || '?';
       const model = info.model ? ` (${info.model})` : '';
-      const sid = info.sessionId ? `${info.sessionId.slice(0, 6)} ` : '';
+      const fleetAgent = info.fleetAgent || r?.fleetAgent || null;
+      const sid = fleetAgent
+        ? `${fleetAgent} `
+        : (info.sessionId ? `${info.sessionId.slice(0, 6)} ` : '');
       const pin = (info.pinned || r?.pinned) ? ' [pin]' : '';
       writeActivity(`${sid}${info.method} ${info.path}${model} → ${acct}${pin} (${info.status}, ${dur}s)`);
     };
