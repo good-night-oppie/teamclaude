@@ -737,10 +737,12 @@ export function formatUsageReport(doc, { color = process.stdout.isTTY } = {}) {
  */
 export function createUsageServer(options = {}) {
   const host = options.host || process.env.TEAMCLAUDE_USAGE_HOST || '127.0.0.1';
-  const port = Number(options.port || process.env.TEAMCLAUDE_USAGE_PORT || process.env.PORT || 3457);
+  const envPort = process.env.TEAMCLAUDE_USAGE_PORT || process.env.PORT;
+  const port = Number(options.port ?? (envPort != null && envPort !== '' ? envPort : 3457));
   const token = options.token || process.env.TEAMCLAUDE_USAGE_TOKEN || process.env.USAGE_TOKEN || null;
   const ttlMs = options.ttlMs ?? 2000;
   const usageOptions = options.usageOptions || {};
+  const allowOrigin = options.allowOrigin || process.env.TEAMCLAUDE_USAGE_ALLOW_ORIGIN || null;
 
   let cache = null;
   let inFlight = null;
@@ -765,9 +767,17 @@ export function createUsageServer(options = {}) {
   }
 
   const server = createServer(async (req, res) => {
-    // Non-loopback authentication gate
+    // Non-loopback authentication gate (fails closed)
     const isLoopback = host === '127.0.0.1' || host === 'localhost' || host === '::1';
-    if (!isLoopback && token) {
+    if (!isLoopback) {
+      if (!token) {
+        res.writeHead(401, {
+          'Content-Type': 'application/json',
+          'Cache-Control': 'no-store',
+        });
+        res.end(JSON.stringify({ error: 'Unauthorized: bearer token required for non-loopback bind' }));
+        return;
+      }
       const authHeader = req.headers['authorization'] || '';
       const apiKeyHeader = req.headers['x-api-key'] || '';
       const matchBearer = authHeader.startsWith('Bearer ') && safeCompare(authHeader.slice(7), token);
@@ -777,7 +787,7 @@ export function createUsageServer(options = {}) {
           'Content-Type': 'application/json',
           'Cache-Control': 'no-store',
         });
-        res.end(JSON.stringify({ error: 'Unauthorized: bearer token required for non-loopback bind' }));
+        res.end(JSON.stringify({ error: 'Unauthorized: invalid bearer token' }));
         return;
       }
     }
@@ -810,7 +820,7 @@ export function createUsageServer(options = {}) {
         res.writeHead(200, {
           'Content-Type': 'application/json',
           'Cache-Control': 'no-store',
-          'Access-Control-Allow-Origin': '*',
+          ...(allowOrigin ? { 'Access-Control-Allow-Origin': allowOrigin } : {}),
         });
         res.end(JSON.stringify(doc, null, 2));
       } catch (err) {

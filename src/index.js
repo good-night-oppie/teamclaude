@@ -1272,6 +1272,15 @@ async function usageCommand() {
     const hostArg = argValue('--host') || args.find(a => a.startsWith('--host='))?.slice('--host='.length);
     const tokenArg = argValue('--token') || args.find(a => a.startsWith('--token='))?.slice('--token='.length);
 
+    const resolvedHost = hostArg || process.env.TEAMCLAUDE_USAGE_HOST || '127.0.0.1';
+    const resolvedToken = tokenArg || process.env.TEAMCLAUDE_USAGE_TOKEN || process.env.USAGE_TOKEN || null;
+    const isLoopback = resolvedHost === '127.0.0.1' || resolvedHost === 'localhost' || resolvedHost === '::1';
+
+    if (!isLoopback && !resolvedToken) {
+      console.error('Error: Non-loopback usage serve requires --token <token> or TEAMCLAUDE_USAGE_TOKEN in environment.');
+      process.exit(1);
+    }
+
     const config = await loadOrCreateConfig();
     const serverInstance = createUsageServer({
       port: portArg ? Number(portArg) : undefined,

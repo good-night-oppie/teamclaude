@@ -346,11 +346,11 @@ test('createUsageServer serves /health and /usage over loopback HTTP', async () 
       assert.ok(healthData.timestamp);
       assert.ok(healthData.version);
 
-      // Test GET /usage
+      // Test GET /usage - by default no wildcard CORS header
       const usageRes = await fetch(`http://127.0.0.1:${bound.port}/usage`);
       assert.equal(usageRes.status, 200);
       assert.equal(usageRes.headers.get('cache-control'), 'no-store');
-      assert.equal(usageRes.headers.get('access-control-allow-origin'), '*');
+      assert.equal(usageRes.headers.get('access-control-allow-origin'), null);
       const usageData = await usageRes.json();
       assert.equal(usageData.schemaVersion, 1);
       assert.equal(usageData.summary.activeAccount, 'user@example.com');
@@ -368,6 +368,27 @@ test('createUsageServer serves /health and /usage over loopback HTTP', async () 
       await unknownRes.text();
     } finally {
       await server.close();
+    }
+
+    // Test with explicit allowOrigin
+    const corsServer = createUsageServer({
+      port: 0,
+      host: '127.0.0.1',
+      allowOrigin: 'https://example.com',
+      usageOptions: {
+        status: fixture.status,
+        config: fixture.config,
+        quotaDir: join(dir, 'empty-quota'),
+      },
+    });
+    const corsBound = await corsServer.listen();
+    try {
+      const res = await fetch(`http://127.0.0.1:${corsBound.port}/usage`);
+      assert.equal(res.status, 200);
+      assert.equal(res.headers.get('access-control-allow-origin'), 'https://example.com');
+      await res.json();
+    } finally {
+      await corsServer.close();
     }
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -399,7 +420,27 @@ test('createUsageServer enforces bearer token on non-loopback bind', async () =>
       await server.close();
     }
 
-    // Now test server with non-loopback host
+    // Test non-loopback server with NO token configured (fails closed)
+    const noTokenServer = createUsageServer({
+      port: 0,
+      host: '0.0.0.0',
+      token: null,
+      usageOptions: {
+        status: fixture.status,
+        config: fixture.config,
+        quotaDir: join(dir, 'empty-quota'),
+      },
+    });
+    const noTokenBound = await noTokenServer.listen();
+    try {
+      const res = await fetch(`http://127.0.0.1:${noTokenBound.port}/usage`);
+      assert.equal(res.status, 401);
+      await res.text();
+    } finally {
+      await noTokenServer.close();
+    }
+
+    // Now test server with non-loopback host and configured token
     const nonLoopServer = createUsageServer({
       port: 0,
       host: '0.0.0.0',
@@ -516,4 +557,30 @@ test('CLI: `teamclaude usage serve` starts server and responds over HTTP', async
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('CLI: `teamclaude usage serve` fails fast on non-loopback host without token', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-cli-serve-fail-'));
+  try {
+    const configPath = join(dir, 'teamclaude.json');
+    const fixture = createSampleFixture();
+    await writeFile(configPath, JSON.stringify(fixture.config, null, 2));
+
+    const res = spawnSync(process.execPath, [CLI, 'usage', 'serve', '--host', '0.0.0.0'], {
+      cwd: dir,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        TEAMCLAUDE_CONFIG: configPath,
+        TEAMCLAUDE_USAGE_TOKEN: '',
+        USAGE_TOKEN: '',
+      },
+    });
+
+    assert.equal(res.status, 1, `CLI exited ${res.status}: ${res.stdout} ${res.stderr}`);
+    assert.match(res.stderr, /Non-loopback usage serve requires/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 
