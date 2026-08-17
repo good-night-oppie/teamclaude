@@ -421,6 +421,11 @@ test('createUsageServer enforces bearer token on non-loopback bind', async () =>
     }
 
     // Test non-loopback server with NO token configured (fails closed)
+    const savedUsageToken = process.env.TEAMCLAUDE_USAGE_TOKEN;
+    const savedLegacyToken = process.env.USAGE_TOKEN;
+    delete process.env.TEAMCLAUDE_USAGE_TOKEN;
+    delete process.env.USAGE_TOKEN;
+
     const noTokenServer = createUsageServer({
       port: 0,
       host: '0.0.0.0',
@@ -435,9 +440,14 @@ test('createUsageServer enforces bearer token on non-loopback bind', async () =>
     try {
       const res = await fetch(`http://127.0.0.1:${noTokenBound.port}/usage`);
       assert.equal(res.status, 401);
-      await res.text();
+      const data = await res.json();
+      assert.match(data.error, /bearer token required/);
     } finally {
       await noTokenServer.close();
+      if (savedUsageToken !== undefined) process.env.TEAMCLAUDE_USAGE_TOKEN = savedUsageToken;
+      else delete process.env.TEAMCLAUDE_USAGE_TOKEN;
+      if (savedLegacyToken !== undefined) process.env.USAGE_TOKEN = savedLegacyToken;
+      else delete process.env.USAGE_TOKEN;
     }
 
     // Now test server with non-loopback host and configured token
