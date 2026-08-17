@@ -29,6 +29,7 @@ registerBuildFeature('sessions-endpoint');
 registerBuildFeature('provenance-t7');
 registerBuildFeature('rotation-gate');
 registerBuildFeature('ingress-thinking-strip');
+registerBuildFeature('fleet-agent-name');
 
 /** Path class for T5 last_request / ctx gating. */
 export function classifySessionPath(url) {
@@ -36,6 +37,21 @@ export function classifySessionPath(url) {
   if (path === '/v1/messages/count_tokens') return 'count_tokens';
   if (path === '/v1/messages') return 'messages';
   return 'other';}
+
+/**
+ * Fleet display name from the optional `x-fleet-agent` request header
+ * (set by fleet launchers via ANTHROPIC_CUSTOM_HEADERS). DISPLAY-ONLY:
+ * this value colors/labels the TUI activity stream and MUST NOT enter
+ * rotation/quota/history-reset logic keyed by sessionId — two agents can
+ * claim the same name after a bad handoff, so sessionId stays the key.
+ * Sanitized to [A-Za-z0-9._-]{1,32}; returns null when absent/empty.
+ */
+export function sanitizeFleetAgent(raw) {
+  const v = Array.isArray(raw) ? raw[0] : raw;
+  if (!v || typeof v !== 'string') return null;
+  const clean = v.replace(/[^A-Za-z0-9._-]/g, '').slice(0, 32);
+  return clean || null;
+}
 
 /** Semantic = POST /v1/messages or /v1/messages/count_tokens (not event_logging). */
 export function isSemanticSessionRequest(method, url) {
@@ -604,7 +620,8 @@ export function createProxyRequestListener({
             : `Unknown account pin "${token}"`;
           const reqId = ++counter;
           const sessionId = req.headers['x-claude-code-session-id'] || null;
-          if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(${retired ? 'retired' : 'unknown'} pin: "${token}")`, status: 404, model: null, sessionId, pinned: false });
+          const fleetAgent = sanitizeFleetAgent(req.headers['x-fleet-agent']);
+          if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(${retired ? 'retired' : 'unknown'} pin: "${token}")`, status: 404, model: null, sessionId, fleetAgent, pinned: false });
           res.writeHead(404, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: pinMsg } }));
           return;
@@ -627,7 +644,8 @@ export function createProxyRequestListener({
             : `Unknown account pin "${forcedPin}" (from TC_ACCT)`;
           const reqId = ++counter;
           const sessionId = req.headers['x-claude-code-session-id'] || null;
-          if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(${retired ? 'retired' : 'unknown'} pin: "${forcedPin}")`, status: 404, model: null, sessionId, pinned: false });
+          const fleetAgent = sanitizeFleetAgent(req.headers['x-fleet-agent']);
+          if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(${retired ? 'retired' : 'unknown'} pin: "${forcedPin}")`, status: 404, model: null, sessionId, fleetAgent, pinned: false });
           res.writeHead(404, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: pinMsg } }));
           return;
@@ -642,7 +660,10 @@ export function createProxyRequestListener({
       // /v1/messages and count_tokens). Read from headers up front so it drives
       // session-aware routing (issue #109) and colors the TUI activity stream.
       const sessionId = req.headers['x-claude-code-session-id'] || null;
-      if (!hideActivity) hooks.onRequestStart?.(reqId, { method: req.method, path: req.url, sessionId, pinned: pinnedIndex != null });
+      // Display-only fleet name (see sanitizeFleetAgent); rides the same info
+      // path to the hooks as sessionId but NEVER enters ctx / routing / quota.
+      const fleetAgent = sanitizeFleetAgent(req.headers['x-fleet-agent']);
+      if (!hideActivity) hooks.onRequestStart?.(reqId, { method: req.method, path: req.url, sessionId, fleetAgent, pinned: pinnedIndex != null });
 
       // Buffer request body (needed to resend on a different account after a 429).
       // Peek the top-level `model` field incrementally as chunks arrive so the
@@ -914,7 +935,7 @@ export function createProxyRequestListener({
           else if (st != null && st >= 400) outcome = 'upstream-error-relayed';
           emitProvenance(ctx, { final: true, outcome, response_status: st });
         }
-        if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, sessionId, pinned: ctx.pinnedIndex != null });
+        if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, sessionId, fleetAgent, pinned: ctx.pinnedIndex != null });
       }
     } catch (err) {
       console.error('[TeamClaude] Unhandled error:', err);

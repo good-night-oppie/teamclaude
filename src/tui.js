@@ -41,6 +41,7 @@ const routeColorFn = name => {
 // red (error) and gray (timestamps); includes bright variants for separation.
 const SESSION_FG = [36, 35, 34, 33, 94, 95, 96, 93, 92];
 const SESSION_ID_LEN = 6; // first 6 hex chars — plenty to distinguish a handful
+const FLEET_TAG_MAX = 16; // fleet display name cap (e.g. ai-scientist-26); ≥ SESSION_ID_LEN
 function sessionColorCode(sid) {
   let h = 0;
   for (let i = 0; i < sid.length; i++) h = (h * 31 + sid.charCodeAt(i)) >>> 0;
@@ -48,8 +49,18 @@ function sessionColorCode(sid) {
 }
 // Fixed-width colored short id (blank-padded when there's no session, e.g. a
 // telemetry request), so the activity column stays aligned.
-const sessionTag = sid =>
-  sid ? fg(sessionColorCode(sid), sid.slice(0, SESSION_ID_LEN)) : ' '.repeat(SESSION_ID_LEN);
+// When a fleet display name is present (x-fleet-agent header), show it in place
+// of the 6-char session-id prefix, colored by a stable hash of the NAME and
+// padded to at least SESSION_ID_LEN so short names keep the column aligned;
+// longer names extend up to FLEET_TAG_MAX. Falls back to the session-id prefix,
+// then to blank padding, exactly as before — never both name and sid.
+const sessionTag = (sid, fleetAgent) => {
+  if (fleetAgent) {
+    const name = fleetAgent.slice(0, FLEET_TAG_MAX);
+    return fg(sessionColorCode(fleetAgent), name.padEnd(SESSION_ID_LEN));
+  }
+  return sid ? fg(sessionColorCode(sid), sid.slice(0, SESSION_ID_LEN)) : ' '.repeat(SESSION_ID_LEN);
+};
 
 // Which quota-family bar (F7/S7) a route binds to, or null for a general route.
 // Auto routes are named 'fable'/'sonnet'; a configured route is classified by its
@@ -274,8 +285,9 @@ export class TUI {
     const acct = info.account || r?.account || '?';
     const model = info.model ? ` (${info.model})` : ''; // shown when the request named a model
     const sid = info.sessionId || r?.sessionId || null;
+    const fleetAgent = info.fleetAgent || r?.fleetAgent || null;
     const pin = (info.pinned || r?.pinned) ? dim(' [pin]') : '';
-    this._addLog(`${sessionTag(sid)} ${info.method} ${info.path}${model} → ${acct}${pin} (${info.status}, ${dur}s)`);
+    this._addLog(`${sessionTag(sid, fleetAgent)} ${info.method} ${info.path}${model} → ${acct}${pin} (${info.status}, ${dur}s)`);
   }
 
   _addLog(msg) {
@@ -930,7 +942,7 @@ export class TUI {
       const m = r.model ? dim(` (${r.model})`) : ''; // filled in as soon as the model is peeked from the stream
       const pin = r.pinned ? dim(' [pin]') : '';
       const a = r.account ? ` → ${r.account}${pin}` : '';
-      lines.push(` ${sp} ${gray(r.t)}  ${sessionTag(r.sessionId)} ${r.method} ${r.path}${m}${a} ${dim(`(${el}s...)`)}`);
+      lines.push(` ${sp} ${gray(r.t)}  ${sessionTag(r.sessionId, r.fleetAgent)} ${r.method} ${r.path}${m}${a} ${dim(`(${el}s...)`)}`);
     }
 
     // Completed log

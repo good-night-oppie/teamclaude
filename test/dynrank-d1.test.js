@@ -79,6 +79,9 @@ test('D1: budgeted account with traffic ranks by roll-off vs oauth session reset
     api('budgeted', {
       tokenBudget: { windowSec, maxTokens: 5_000_000 },
       priority: 50, costTier: 0,
+      // Tie fidelity with the oauth account so the session-reset stage decides:
+      // fidelity precedes session in dynamicCompare (see dynrank-fidelity.test.js).
+      fidelity: 'faithful',
     }),
     oauth('oauth', { priority: 0, costTier: 0 }),
   ], 0.98, { routingPolicy: { mode: 'dynamic' } });
