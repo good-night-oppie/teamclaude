@@ -74,6 +74,10 @@ const PERSISTED_QUOTA_FIELDS = [
   'unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable',
   'unified5hReset', 'unified7dReset', 'unified7dSonnetReset', 'unified7dFableReset', 'unifiedStatus',
   'tokensLimit', 'tokensRemaining', 'requestsLimit', 'requestsRemaining', 'resetsAt',
+  // Persisted so a restored reading keeps its real age across a restart. Without
+  // it, restore produces values with no observation time, which then render as
+  // if they were fresh — the exact confusion `observedAt` exists to remove.
+  'observedAt',
 ];
 
 function emptyQuota() {

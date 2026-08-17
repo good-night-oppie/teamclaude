@@ -1097,7 +1097,14 @@ export class TUI {
       || q.tokensLimit != null || q.requestsLimit != null;
     if (!hasQuota) {
       if (!a.disabled) line += `  ${yellow('? no quota data')}`;
-    } else if (q.observedAt != null) {
+    } else if (q.observedAt == null) {
+      // Numbers with no observation time. Reached when a value arrives by some
+      // path that never stamped one -- a restore written before observedAt was
+      // persisted, or any future writer that forgets to stamp. Untagged, such a
+      // value renders exactly like a live reading, which is the confusion this
+      // whole tag exists to remove, so it is called out rather than trusted.
+      if (!a.disabled) line += `  ${yellow('? unverified')}`;
+    } else {
       const age = Date.now() - q.observedAt;
       if (age > QUOTA_STALE_MS) line += `  ${yellow('~ ' + formatAge(age) + ' old')}`;
     }

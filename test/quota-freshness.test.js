@@ -76,3 +76,17 @@ test('an account that never reported quota has no observedAt (distinct from 0% u
   assert.equal(q.unified5h, null);
   assert.equal(q.unified7d, null);
 });
+
+test('observedAt survives export/restore so a restored reading keeps its real age', () => {
+  const am1 = new AccountManager([oauth('a', { accountUuid: 'p1', orgUuid: 'o1' })], 0.98);
+  const twelveDaysAgo = Date.now() - 12 * 86400_000;
+  am1.applyUsageData(0, { sevenDay: { utilization: 1.0 }, observedAt: twelveDaysAgo });
+
+  const [entry] = am1.exportQuotaState();
+  assert.equal(entry.quota.observedAt, twelveDaysAgo, 'observedAt must be persisted');
+
+  const am2 = new AccountManager([oauth('a', { accountUuid: 'p1', orgUuid: 'o1' })], 0.98);
+  am2.restoreQuotaState(am1.exportQuotaState());
+  assert.equal(am2.accounts[0].quota.observedAt, twelveDaysAgo,
+    'a restored reading keeps its original age, not the restart time');
+});
