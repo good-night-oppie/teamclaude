@@ -1348,6 +1348,13 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       },
     });
   }
+  // A custom upstream whose regex engine cannot parse a `pattern` escape rejects
+  // the WHOLE request (DeepSeek: `"^[^\\0]*$" is not a "regex"`), so sanitize
+  // tool schemas before egress. Gated on account.upstream — native Anthropic
+  // accepts Claude Code's NUL guard as-is and must stay byte-identical.
+  if (account.upstream && sendBody.length > 0) {
+    sendBody = stripUnparseablePatterns(sendBody);
+  }
   // Content-Length must match the bytes we actually send. Gate-time advisor
   // strip, sanitize, uuid patch, and model rewrite can all change the length
   // relative to the client's original header — always recompute from sendBody.
@@ -2148,6 +2155,43 @@ function extractUsageFromBody(buffer, accountIndex, accountManager, sessionCtx =
 // `model` field dropped rather than egressing verbatim — the Content-Length
 // update at the write site already handles the size change.
 // Exported for tests.
+// Custom-upstream tool-schema compatibility (2026-09-18).
+// Some third-party Anthropic-compatible backends PARSE a schema's `pattern` value
+// as a regular expression and reject escapes their regex engine does not
+// implement. DeepSeek rejects Claude Code's NUL guard `^[^\0]*$` with
+//   Invalid schema for function 'Artifact': "^[^\\0]*$" is not a "regex"   (400)
+// which kills EVERY tool-bearing Claude Code turn on that route: the client
+// surfaces it as a Fable error, falls back to Sonnet 5, and fails identically
+// because both ids map to the same backend. Diagnosed live 2026-09-18 when
+// bene-6 (a fresh successor) died on its first turn ~90s after handoff.
+// We drop ONLY the patterns the backend provably cannot parse (`\0` escapes);
+// every other keyword — including other `pattern`s — is preserved, so the tool
+// definition stays as close to the client's as the upstream allows. Native
+// Anthropic upstreams accept the guard and are never touched (custom-upstream
+// gate at the call site).
+// Exported for tests.
+export function stripUnparseablePatterns(body) {
+  try {
+    const obj = JSON.parse(body.toString('utf8'));
+    let changed = false;
+    const walk = (node) => {
+      if (Array.isArray(node)) {
+        for (const item of node) walk(item);
+        return;
+      }
+      if (!node || typeof node !== 'object') return;
+      if (typeof node.pattern === 'string' && node.pattern.includes('\\0')) {
+        delete node.pattern;
+        changed = true;
+      }
+      for (const v of Object.values(node)) walk(v);
+    };
+    if (Array.isArray(obj.tools)) walk(obj.tools);
+    if (changed) return Buffer.from(JSON.stringify(obj), 'utf8');
+  } catch { /* not JSON — pass through unchanged */ }
+  return body;
+}
+
 export function rewriteModel(body, modelMap, {
   stripUnmappedAdvisor = false,
   onAdvisorStrip = null,
