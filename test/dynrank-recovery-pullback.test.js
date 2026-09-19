@@ -8,24 +8,35 @@ import { AccountManager } from '../src/account-manager.js';
 // flipped its status back to 'active', but the session stayed on
 // deepseek-v4-flash for ~40 minutes — dynrank never pulled it back. Root cause,
 // confirmed by reading the code (not guessed from symptoms): the
-// error/throttled -> active transitions never set `requalify`, and even if they
-// had, `_selectForSession`'s ONLY pull-back check compared `costTier` with a
-// strict `<` — with costTier unconfigured (every account defaults to 0, see
-// makeAccount), `cheaperEligible` is permanently false, so nothing could ever
-// win the comparison regardless of timing.
+// error/throttled -> active transitions never signalled recovery at all, and
+// `_selectForSession`'s ONLY pull-back check compared `costTier` with a strict
+// `<` — with costTier unconfigured (every account defaults to 0, see
+// makeAccount), `cheaperEligible` is permanently false regardless of timing.
 //
-// Fix: the three recovery transitions (setDisabled re-enable, clearRateLimited,
-// updateAccountTokens after an error) now set `account.requalify = true`.
-// `_selectForSession`'s dynamic+preserveSessionAffinity branch consumes that
-// flag and re-ranks the recovered account against the pin using
-// `dynamicCompare` — the same comparator dynamic mode uses everywhere else —
-// instead of the tier-only `cheaperEligible` check, which stays for its
-// original (hard economic boundary) purpose.
+// Fix v1 (initial): four recovery transitions set a one-shot
+// `account.requalify` boolean, consumed by the first `_selectForSession` call
+// that looked at it, using `dynamicCompare` to rank the recovery against the
+// pin. PR #7 review (macroscope + coderabbitai, independently) found this had
+// two real defects:
+//   (a) the flag was consumed GLOBALLY on the account — a second session
+//       pinned to the SAME fallback would never see the same recovery event,
+//       because the first session to check already cleared it.
+//   (b) two recovery transitions were missing entirely: an ORDINARY
+//       disabled->enabled toggle (setDisabled only armed it inside the
+//       error-clearing branch), and AUTOMATIC rate-limit expiry
+//       (refreshExpiredQuotas, which runs on every getActiveAccount call and
+//       is the MOST common recovery trigger in practice — distinct from the
+//       manual/probe path clearRateLimited covers).
 //
-// `priority-first` mode is untouched and needs no fix: `betterExists` there
-// re-checks `account.priority` on every request with no flag/memoization, so a
-// recovered account is picked up on the very next request. It is a hand
-// workaround for this bug (Eddie approved it live), not the buggy path itself.
+// Fix v2 (this file): `account.requalifiedAt` is a TIMESTAMP, not a consumed
+// flag. `sessionTracker` tracks a per-session watermark
+// (`lastRecoveryCheckAt`); a session evaluates a recovery iff
+// `requalifiedAt > its own watermark`, then advances ITS OWN watermark —
+// never touching any other session's. Two sessions on the same fallback each
+// get an independent look at the same event. All FOUR recovery transitions
+// (setDisabled both branches, clearRateLimited, refreshExpiredQuotas
+// automatic expiry, updateAccountTokens) now call the same `_markRequalified`
+// helper.
 
 function oauth(name, extra = {}) {
   return { name, type: 'oauth', accessToken: `t-${name}`, refreshToken: 'r', expiresAt: Date.now() + 3600_000, ...extra };
@@ -42,13 +53,19 @@ function dynamicAffinity(accounts, opts = {}) {
 const NOW = Date.now();
 const H = 60 * 60 * 1000;
 
+function measured(am, idx, { u5 = 0.1, r5, u7 = 0.1, r7 } = {}) {
+  const q = am.accounts[idx].quota;
+  if (u5 != null) q.unified5h = u5;
+  if (r5 != null) q.unified5hReset = r5;
+  if (u7 != null) q.unified7d = u7;
+  if (r7 != null) q.unified7dReset = r7;
+}
+
 test('the live incident, reconstructed: an account.status error->active pulls the session home', () => {
   const am = dynamicAffinity([
     oauth('home', { priority: 0, costTier: 0 }),
     oauth('fallback', { priority: 20, costTier: 0 }),
   ]);
-  // home fails: pin the session onto it first (as if it had been healthy),
-  // then simulate the outage the same way the gateway does.
   am.recordSession('s1', 0);
   am.accounts[0].status = 'error';
   const during = am.getActiveAccount(null, 'claude-opus-4-8', null, 's1');
@@ -59,13 +76,13 @@ test('the live incident, reconstructed: an account.status error->active pulls th
   // re-auth), the one that actually fired in the incident.
   am.updateAccountTokens(0, { accessToken: 't-home-2' });
   assert.equal(am.accounts[0].status, 'active');
-  assert.equal(am.accounts[0].requalify, true, 'updateAccountTokens must arm requalify on recovery');
+  assert.ok(am.accounts[0].requalifiedAt > 0, 'updateAccountTokens must stamp requalifiedAt on recovery');
 
   const after = am.getActiveAccount(null, 'claude-opus-4-8', null, 's1');
   assert.equal(after.name, 'home', 'the session must be pulled back once its home account recovers');
 });
 
-test('clearRateLimited also arms requalify and pulls the session back', () => {
+test('clearRateLimited (manual/probe path) also stamps recovery and pulls the session back', () => {
   const am = dynamicAffinity([
     oauth('home', { priority: 0, costTier: 0 }),
     oauth('fallback', { priority: 20, costTier: 0 }),
@@ -77,24 +94,87 @@ test('clearRateLimited also arms requalify and pulls the session back', () => {
   am.recordSession('s1', during.index);
 
   am.clearRateLimited(0);
-  assert.equal(am.accounts[0].requalify, true);
+  assert.ok(am.accounts[0].requalifiedAt > 0);
   assert.equal(am.getActiveAccount(null, 'claude-opus-4-8', null, 's1').name, 'home');
 });
 
-test('setDisabled re-enable also arms requalify and pulls the session back', () => {
+test('automatic rate-limit EXPIRY (refreshExpiredQuotas) also pulls the session back — the missing path from PR #7 review', () => {
+  // This is the AUTOMATIC path (runs on every getActiveAccount call), distinct
+  // from clearRateLimited's manual/probe path above. It was NOT covered at all
+  // in the first version of this fix (coderabbitai finding).
   const am = dynamicAffinity([
     oauth('home', { priority: 0, costTier: 0 }),
     oauth('fallback', { priority: 20, costTier: 0 }),
   ]);
   am.recordSession('s1', 0);
-  am.accounts[0].status = 'error';
+  am.markRateLimited(0, 1); // 1 second
   const during = am.getActiveAccount(null, 'claude-opus-4-8', null, 's1');
   assert.equal(during.name, 'fallback');
   am.recordSession('s1', during.index);
 
-  am.setDisabled(0, false); // re-enable clears the stuck error
-  assert.equal(am.accounts[0].requalify, true);
+  am.accounts[0].rateLimitedUntil = Date.now() - 1; // force it already-expired
+  // getActiveAccount calls refreshExpiredQuotas internally as its first step —
+  // no separate clearRateLimited call, this is the automatic path.
+  const after = am.getActiveAccount(null, 'claude-opus-4-8', null, 's1');
+  assert.ok(am.accounts[0].requalifiedAt > 0, 'automatic expiry must stamp requalifiedAt too');
+  assert.equal(after.name, 'home', 'automatic throttle expiry must pull the session back, not just manual clearRateLimited');
+});
+
+test('setDisabled ordinary toggle (status already active, no error involved) also pulls the session back — the other missing path from PR #7 review', () => {
+  // Distinct from the error-clearing branch: the account's status is 'active'
+  // the whole time, only `disabled` flips. The first version of this fix only
+  // armed recovery inside `if (account.status === 'error')` and missed this.
+  const am = dynamicAffinity([
+    oauth('home', { priority: 0, costTier: 0 }),
+    oauth('fallback', { priority: 20, costTier: 0 }),
+  ]);
+  am.recordSession('s1', 0);
+  am.setDisabled(0, true); // operator maintenance toggle, status stays 'active'
+  assert.equal(am.accounts[0].status, 'active', 'precondition: disabling does not touch status');
+  const during = am.getActiveAccount(null, 'claude-opus-4-8', null, 's1');
+  assert.equal(during.name, 'fallback');
+  am.recordSession('s1', during.index);
+
+  am.setDisabled(0, false); // re-enable — ordinary toggle, not error-clearing
+  assert.ok(am.accounts[0].requalifiedAt > 0, 'ordinary disabled->enabled must stamp requalifiedAt too');
   assert.equal(am.getActiveAccount(null, 'claude-opus-4-8', null, 's1').name, 'home');
+});
+
+test('setDisabled(true) itself does NOT stamp recovery (only the ->false transition is a recovery)', () => {
+  const am = dynamicAffinity([oauth('a', { priority: 0, costTier: 0 })]);
+  am.setDisabled(0, true);
+  assert.equal(am.accounts[0].requalifiedAt || 0, 0, 'disabling is not a recovery event');
+});
+
+test('TWO sessions pinned to the SAME fallback each get an independent pull-back — the core PR #7 defect', () => {
+  // This is the central bug both reviewers found: a global one-shot flag
+  // meant the FIRST session to check a recovered account consumed it, leaving
+  // every other session sharing that fallback stuck forever.
+  const am = dynamicAffinity([
+    oauth('home', { priority: 0, costTier: 0 }),
+    oauth('fallback', { priority: 20, costTier: 0 }),
+  ]);
+  am.recordSession('s1', 0);
+  am.recordSession('s2', 0);
+  am.accounts[0].status = 'error';
+
+  const s1During = am.getActiveAccount(null, 'claude-opus-4-8', null, 's1');
+  am.recordSession('s1', s1During.index);
+  const s2During = am.getActiveAccount(null, 'claude-opus-4-8', null, 's2');
+  am.recordSession('s2', s2During.index);
+  assert.equal(s1During.name, 'fallback');
+  assert.equal(s2During.name, 'fallback');
+
+  am.updateAccountTokens(0, { accessToken: 't-2' }); // ONE recovery event
+
+  // s1 checks first and pulls back.
+  const s1After = am.getActiveAccount(null, 'claude-opus-4-8', null, 's1');
+  assert.equal(s1After.name, 'home', 's1 must be pulled back');
+
+  // s2 must ALSO be pulled back by the SAME recovery event — this is exactly
+  // what the global-flag version got wrong (s1 would have consumed it).
+  const s2After = am.getActiveAccount(null, 'claude-opus-4-8', null, 's2');
+  assert.equal(s2After.name, 'home', 's2 must independently see the SAME recovery event s1 already consumed under the old design');
 });
 
 test('a recovery that ranks WORSE than the current pin does NOT pull the session', () => {
@@ -109,16 +189,13 @@ test('a recovery that ranks WORSE than the current pin does NOT pull the session
   measured(am, 0, { r7: NOW + H });      // best: resets soon (dynamic-preferred)
   measured(am, 1, { r7: NOW + 96 * H }); // worse: resets far out
   am.recordSession('s1', 0);
-  am.accounts[1].status = 'error';
-  am.clearRateLimited(1); // no-op path guard: status isn't 'throttled', exercise the flag directly
-  am.accounts[1].requalify = true; // simulate the recovery event directly (status transition tested above)
+  am._markRequalified(am.accounts[1]); // simulate a recovery event on the worse account
 
   const result = am.getActiveAccount(null, 'claude-opus-4-8', null, 's1');
   assert.equal(result.name, 'best', 'a worse-ranked recovery must not displace a better-ranked pin');
-  assert.equal(am.accounts[1].requalify, false, 'the flag is still consumed even when it does not win');
 });
 
-test('the requalify flag is consumed exactly once — no re-check storm on every request', () => {
+test('this session does not re-scan on every subsequent request for a recovery it already evaluated', () => {
   const am = dynamicAffinity([
     oauth('home', { priority: 0, costTier: 0 }),
     oauth('fallback', { priority: 20, costTier: 0 }),
@@ -129,11 +206,9 @@ test('the requalify flag is consumed exactly once — no re-check storm on every
   am.updateAccountTokens(0, { accessToken: 't-2' });
 
   assert.equal(am.getActiveAccount(null, 'claude-opus-4-8', null, 's1').name, 'home');
-  assert.equal(am.accounts[0].requalify, false, 'consumed on the pull-back that used it');
 
-  // Fail again without a new recovery event: must NOT spuriously pull back a
-  // second time (there is nothing to pull back FROM this time — establishes
-  // the flag doesn't linger and cause phantom re-evaluation).
+  // Fail again without a NEW recovery event: must not spuriously pull back a
+  // second time off the same already-evaluated watermark.
   am.accounts[0].status = 'error';
   const again = am.getActiveAccount(null, 'claude-opus-4-8', null, 's1');
   assert.equal(again.name, 'fallback');
@@ -151,15 +226,15 @@ test('preserveSessionAffinity:false is untouched by the recovery path', () => {
   am.accounts[0].status = 'error';
   am.recordSession('s1', am.getActiveAccount(null, 'claude-opus-4-8', null, 's1').index);
   am.updateAccountTokens(0, { accessToken: 't-2' });
-  // With affinity off, the session-pin branch is skipped entirely (line 708's
-  // guard), so recovery has nothing to pull back INTO — best-available runs on
-  // every request regardless, same as it always did.
+  // With affinity off, the session-pin branch is skipped entirely, so recovery
+  // has nothing to pull back INTO — best-available runs on every request
+  // regardless, same as it always did.
   assert.equal(am.getActiveAccount(null, 'claude-opus-4-8', null, 's1').name, 'home');
 });
 
 test('priority-first mode needs no fix: the very next request re-checks priority live', () => {
   // This is the actual workaround Eddie approved live (mode switched to
-  // priority-first). Confirms it was never broken — no requalify plumbing
+  // priority-first). Confirms it was never broken — no recovery plumbing
   // needed on this path.
   const am = new AccountManager([
     oauth('home', { priority: 0, costTier: 0 }),
@@ -171,15 +246,7 @@ test('priority-first mode needs no fix: the very next request re-checks priority
   assert.equal(during.name, 'fallback');
   am.recordSession('s1', during.index);
 
-  am.accounts[0].status = 'active'; // no requalify plumbing exercised at all
+  am.accounts[0].status = 'active'; // no recovery plumbing exercised at all
   assert.equal(am.getActiveAccount(null, 'claude-opus-4-8', null, 's1').name, 'home',
     'betterExists re-derives priority order on every call — recovery is immediate by construction');
 });
-
-function measured(am, idx, { u5 = 0.1, r5, u7 = 0.1, r7 } = {}) {
-  const q = am.accounts[idx].quota;
-  if (u5 != null) q.unified5h = u5;
-  if (r5 != null) q.unified5hReset = r5;
-  if (u7 != null) q.unified7d = u7;
-  if (r7 != null) q.unified7dReset = r7;
-}
