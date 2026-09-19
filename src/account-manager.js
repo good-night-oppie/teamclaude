@@ -686,6 +686,45 @@ export class AccountManager {
               this._isAvailable(a, model, advisorModel)
               && !exclude?.has(a.index)
               && this._costTierFor(a, model) < pinnedTier);
+            // Recovery pull-back (2026-09-19, Eddie-approved): `requalify` marks
+            // an account that JUST became usable again (re-enabled, rate-limit
+            // cleared, OAuth token refreshed after an error). Without this, a
+            // session that failed over while its home account was down stays on
+            // the fallback FOREVER — costTier comparison alone cannot catch this
+            // when tiers are unconfigured (all accounts costTier=0, so
+            // `cheaperEligible` above is permanently false).
+            //
+            // Consume the flag on THIS decision regardless of outcome: a session
+            // that stays pinned (recovered account not actually preferred, or not
+            // available for THIS model) must not re-check every single request —
+            // that re-opens exactly the polling/thrash preserveSessionAffinity
+            // exists to prevent. The NEXT recovery event re-arms it.
+            //
+            // Ranking uses dynamicCompare — the same comparator dynamic mode uses
+            // everywhere else — not the strict tier `<` above, so a recovery that
+            // is merely tied on tier (the common case: costTier unconfigured, or
+            // same tier by design) can still win on the comparator's later keys
+            // (fidelity, weekly/session reset, utilization, priority). A recovery
+            // ranked WORSE than the current pin is correctly left alone — this is
+            // "pull back the true home account", not "prefer anything that just
+            // changed state".
+            let recovered = null;
+            for (const a of this.accounts) {
+              if (!a.requalify || a.index === pinned.index) continue;
+              a.requalify = false; // consume regardless of whether it wins below
+              if (!this._isAvailable(a, model, advisorModel) || exclude?.has(a.index)) continue;
+              if (this.dynamicCompare(a, pinned, model) < 0
+                  && (!recovered || this.dynamicCompare(a, recovered, model) < 0)) {
+                recovered = a;
+              }
+            }
+            pinned.requalify = false; // pinned needed no pull-back; consume its own flag too
+            if (recovered) {
+              this._rememberDynamic(this._dynamicKey(model, advisorModel), recovered);
+              this._beginRamp(recovered);
+              console.log(`[TeamClaude] Session pin recovery: "${recovered.name}" is back and ranks ahead of "${pinned.name}" — pulling the session back`);
+              return recovered;
+            }
             if (!cheaperEligible) return pinned;
           }
         } else {
@@ -2127,6 +2166,11 @@ export class AccountManager {
     if (!disabled && account.status === 'error') {
       account.status = 'active';
       account.rateLimitedUntil = null;
+      // A session may be pinned to whatever covered while this account was
+      // down; requalify lets pin-affinity selection pull back to it now that
+      // it works again (2026-09-19, Eddie-approved: dynrank must hide
+      // recovery, not leave a session parked on the fallback indefinitely).
+      account.requalify = true;
       console.log(`[TeamClaude] Account "${account.name}" re-enabled — clearing error state`);
     }
   }
@@ -2192,6 +2236,9 @@ export class AccountManager {
     account.status = 'active';
     account.rateLimitedUntil = null;
     account.throttledAt = null;
+    // See setDisabled: a pinned session may be on the fallback that covered
+    // this account while it was throttled — requalify offers it back.
+    account.requalify = true;
     console.log(`[TeamClaude] Account "${account.name}" revalidated — rate limit no longer applies, back in rotation`);
   }
 
@@ -2272,7 +2319,13 @@ export class AccountManager {
     account.credential = accessToken;
     if (refreshToken) account.refreshToken = refreshToken;
     account.expiresAt = expiresAt;
-    if (account.status === 'error') account.status = 'active';
+    if (account.status === 'error') {
+      account.status = 'active';
+      // See setDisabled: an OAuth token refresh (e.g. after re-auth clears a
+      // revoked-grant error) is exactly the "recovered" event a pinned session
+      // needs offered back to it.
+      account.requalify = true;
+    }
     console.log(`[TeamClaude] Updated tokens for account "${account.name}"`);
     this._onTokenRefresh?.(accountIndex, {
       accessToken,
