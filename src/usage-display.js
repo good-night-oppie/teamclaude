@@ -18,13 +18,19 @@ function secToMs(value) {
   return n < 1e12 ? n * 1000 : n;
 }
 
+function frac(value) {
+  if (value == null || value === '') return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
 /** Map a probe-written quota state file (unified_5h/7d fractions) into applyUsageData. */
 export function usageFromQuotaState(data, provider = 'codex') {
   if (!data || typeof data !== 'object') return null;
-  const five = Number(data.unified_5h_utilization);
-  const seven = Number(data.unified_7d_utilization);
-  const fiveHour = Number.isFinite(five) ? { utilization: five, resetAt: secToMs(data.unified_5h_reset) } : null;
-  const sevenDay = Number.isFinite(seven) ? { utilization: seven, resetAt: secToMs(data.unified_7d_reset) } : null;
+  const five = frac(data.unified_5h_utilization);
+  const seven = frac(data.unified_7d_utilization);
+  const fiveHour = five != null ? { utilization: five, resetAt: secToMs(data.unified_5h_reset) } : null;
+  const sevenDay = seven != null ? { utilization: seven, resetAt: secToMs(data.unified_7d_reset) } : null;
   if (!fiveHour && !sevenDay) return null;
   const nativeWindows = [];
   if (fiveHour) nativeWindows.push({
