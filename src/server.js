@@ -1865,7 +1865,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // Extract rate limit headers
     const rateLimitHeaders = {};
     for (const [key, value] of upstreamRes.headers.entries()) {
-      if (key.startsWith('anthropic-ratelimit-')) {
+      if (key.startsWith('anthropic-ratelimit-') || key.startsWith('x-ratelimit-')) {
         rateLimitHeaders[key] = value;
       }
     }
