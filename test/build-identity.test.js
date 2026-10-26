@@ -18,6 +18,7 @@ function close(server) {
 }
 
 const EXPECTED_FEATURES = [
+  'anthropic-native-scaffold',
   'audit-b1-b6',
   'context-overflow-relay',
   'custom-advisor',

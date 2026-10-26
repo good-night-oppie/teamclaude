@@ -81,7 +81,7 @@ test('adapter-down classifier: empty 5xx is down, JSON error envelope is not', (
   assert.equal(isCustomAdapterDown(502, '{"error":"context_length_exceeded"}'), false);
 });
 
-test('JSON 500 on exclusive custom account is relayed without a circuit hop', async () => {
+test('JSON 500 on exclusive custom account is scaffolded to 529 without a circuit hop', async () => {
   let primaryHits = 0;
   let otherHits = 0;
   const primary = http.createServer((_req, res) => {
@@ -109,8 +109,9 @@ test('JSON 500 on exclusive custom account is relayed without a circuit hop', as
       body: JSON.stringify({ model: 'gpt-6-astra', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] }),
     });
     const text = await res.text();
-    assert.equal(res.status, 500, text.slice(0, 300));
-    assert.match(text, /Internal server error/);
+    assert.equal(res.status, 529, text.slice(0, 300));
+    assert.match(text, /overloaded_error/);
+    assert.match(text, /Overloaded/);
     assert.equal(primaryHits, 1);
     assert.equal(otherHits, 0, 'must not hop; Sol/Terra share this account');
     assert.equal(am.accounts[0].consecutiveFailures, 0);

@@ -23,7 +23,7 @@ import { BodyWriter } from './request-log.js';
 import { upstreamFetch } from './upstream-fetch.js';
 import { tunnelTls } from './sx.js';
 import { buildIdentity, PROCESS_STARTED_AT, registerBuildFeature } from './build-identity.js';
-import { isContextOverflowError, isCustomAdapterDown, anthropicPromptTooLongBody } from './context-overflow.js';
+import { toNativeAnthropicClientError } from './anthropic-native-scaffold.js';
 import { ProvenanceBuffer, classifyUpstreamRelayOutcome } from './provenance.js';
 // Ensure the model-preflight layer's tag is registered even when the CLI entry
 // has not been loaded (status via createProxyServer alone).
@@ -42,6 +42,7 @@ registerBuildFeature('custom-advisor');
 registerBuildFeature('plaintext-toolcall');
 registerBuildFeature('media-prune');
 registerBuildFeature('context-overflow-relay');
+registerBuildFeature('anthropic-native-scaffold');
 
 /** Path class for T5 last_request / ctx gating. */
 export function classifySessionPath(url) {
@@ -1962,48 +1963,26 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
           && retryCount < maxRetries && ctx.pinnedIndex == null) {
         try { overflowText = await upstreamRes.text(); peekedBody = true; } catch { overflowText = ''; }
       }
-      if (isContextOverflowError(upstreamRes.status, overflowText)
-          && !res.headersSent && !res.destroyed) {
+      const native = toNativeAnthropicClientError(
+        upstreamRes.status, overflowText, ctx.model,
+      );
+      if (native && !res.headersSent && !res.destroyed) {
         if (!peekedBody) await upstreamRes.body?.cancel();
         accountManager.noteProviderResult(account.index, {
-          ok: true, status: 400, latencyMs: Date.now() - attemptStartedAt,
+          ok: true, status: native.status, latencyMs: Date.now() - attemptStartedAt,
         });
-        const payload = anthropicPromptTooLongBody(overflowText);
-        ctx.status = 400;
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(payload));
-        console.log(`[TeamClaude] Context overflow on "${account.name}" — relaying prompt-too-long (no circuit)`);
+        ctx.status = native.status;
+        res.writeHead(native.status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(native.body));
+        const label = native.outcome === 'context-overflow-relay'
+          ? `Context overflow on "${account.name}" — relaying prompt-too-long (no circuit)`
+          : `Custom upstream ${upstreamRes.status} → Anthropic ${native.status} (${native.outcome}) on "${account.name}" — no circuit`;
+        console.log(`[TeamClaude] ${label}`);
         emitProvenance(ctx, {
           _account: account,
           final: true,
-          outcome: 'context-overflow-relay',
-          response_status: 400,
-          attempt: ctx.attempt,
-          timings: {
-            admit_ms: admitMs,
-            headers_ms: ctx.attemptRec.headers_ms,
-            total_ms: Date.now() - attemptStartedAt,
-          },
-        });
-        return;
-      }
-      if (!isCustomAdapterDown(upstreamRes.status, overflowText)
-          && !res.headersSent && !res.destroyed) {
-        if (!peekedBody) await upstreamRes.body?.cancel();
-        accountManager.noteProviderResult(account.index, {
-          ok: true, status: upstreamRes.status, latencyMs: Date.now() - attemptStartedAt,
-        });
-        ctx.status = upstreamRes.status;
-        res.writeHead(upstreamRes.status, {
-          'Content-Type': upstreamRes.headers.get('content-type') || 'application/json',
-        });
-        res.end(overflowText);
-        console.log(`[TeamClaude] Custom upstream ${upstreamRes.status} application error on "${account.name}" — relay, no circuit`);
-        emitProvenance(ctx, {
-          _account: account,
-          final: true,
-          outcome: 'upstream-error-relayed',
-          response_status: upstreamRes.status,
+          outcome: native.outcome,
+          response_status: native.status,
           attempt: ctx.attempt,
           timings: {
             admit_ms: admitMs,
